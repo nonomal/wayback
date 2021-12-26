@@ -1,5 +1,5 @@
 export GO111MODULE = on
-export CGO_ENABLED = 0
+export CGO_ENABLED = 1
 export GOPROXY = https://proxy.golang.org
 
 NAME = wayback
@@ -9,7 +9,7 @@ PACKDIR ?= ./build/package
 LDFLAGS := $(shell echo "-X '${REPO}/version.Version=`git describe --tags --abbrev=0`'")
 LDFLAGS := $(shell echo "${LDFLAGS} -X '${REPO}/version.Commit=`git rev-parse --short HEAD`'")
 LDFLAGS := $(shell echo "${LDFLAGS} -X '${REPO}/version.BuildDate=`date +%FT%T%z`'")
-GOBUILD ?= go build -trimpath --ldflags "-s -w ${LDFLAGS} -buildid=" -v
+GOBUILD ?= go build -trimpath --ldflags "-s -w ${LDFLAGS} -buildid=" -race -v
 VERSION ?= $(shell git describe --tags `git rev-list --tags --max-count=1` | sed -e 's/v//g')
 GOFILES ?= $(wildcard ./cmd/wayback/*.go)
 PROJECT := github.com/wabarc/wayback
@@ -123,7 +123,7 @@ fmt: ## Format codebase
 
 vet: ## Vet codebase
 	@echo "-> Running go vet"
-	@go vet $(PACKAGES)
+	@go vet -race $(PACKAGES)
 
 test: ## Run testing
 	@echo "-> Running go test"
