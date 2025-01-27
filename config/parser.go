@@ -37,7 +37,7 @@ func (p *Parser) ParseEnvironmentVariables() (*Options, error) {
 func (p *Parser) ParseFile(filename string) (*Options, error) {
 	if filename == "" {
 		for _, path := range defaultFilenames() {
-			_, err := os.Open(path)
+			_, err := os.Open(filepath.Clean(path))
 			if err != nil {
 				continue
 			}
@@ -46,7 +46,7 @@ func (p *Parser) ParseFile(filename string) (*Options, error) {
 		}
 	}
 
-	fp, err := os.Open(filename)
+	fp, err := os.Open(filepath.Clean(filename))
 	if err != nil {
 		return nil, err
 	}
@@ -88,17 +88,25 @@ func (p *Parser) parseLines(lines []string) (err error) {
 			p.opts.logLevel = parseString(val, defLogLevel)
 		case "ENABLE_METRICS":
 			p.opts.metrics = parseBool(val, defMetrics)
-		case "HTTP_LISTEN_ADDR":
+		case "HTTP_LISTEN_ADDR", "WAYBACK_LISTEN_ADDR":
 			p.opts.listenAddr = parseString(val, defListenAddr)
 		case "CHROME_REMOTE_ADDR":
 			p.opts.enabledChromeRemote = hasValue(val, defEnabledChromeRemote)
 			p.opts.chromeRemoteAddr = parseString(val, defChromeRemoteAddr)
+		case "WAYBACK_PROXY":
+			p.opts.proxy = parseString(val, defProxy)
 		case "WAYBACK_IPFS_HOST":
 			p.opts.ipfs.host = parseString(val, defIPFSHost)
 		case "WAYBACK_IPFS_PORT":
-			p.opts.ipfs.port = uint(parseInt(val, defIPFSPort))
+			p.opts.ipfs.port = parseInt(val, defIPFSPort)
 		case "WAYBACK_IPFS_MODE":
 			p.opts.ipfs.mode = parseString(val, defIPFSMode)
+		case "WAYBACK_IPFS_TARGET":
+			p.opts.ipfs.target = parseString(val, defIPFSTarget)
+		case "WAYBACK_IPFS_APIKEY":
+			p.opts.ipfs.apikey = parseString(val, defIPFSApikey)
+		case "WAYBACK_IPFS_SECRET":
+			p.opts.ipfs.secret = parseString(val, defIPFSSecret)
 		case "WAYBACK_USE_TOR":
 			p.opts.overTor = parseBool(val, defOverTor)
 		case "WAYBACK_ENABLE_IA":
@@ -123,6 +131,10 @@ func (p *Parser) parseLines(lines []string) (err error) {
 			p.opts.mastodon.clientSecret = parseString(val, defMastodonClientSecret)
 		case "WAYBACK_MASTODON_TOKEN":
 			p.opts.mastodon.accessToken = parseString(val, defMastodonAccessToken)
+		case "WAYBACK_MASTODON_CW":
+			p.opts.mastodon.cw = parseBool(val, defMastodonCW)
+		case "WAYBACK_MASTODON_CWTEXT":
+			p.opts.mastodon.cwText = parseString(val, defMastodonCWText)
 		case "WAYBACK_TWITTER_CONSUMER_KEY":
 			p.opts.twitter.consumerKey = parseString(val, defTwitterConsumerKey)
 		case "WAYBACK_TWITTER_CONSUMER_SECRET":
@@ -137,8 +149,14 @@ func (p *Parser) parseLines(lines []string) (err error) {
 			p.opts.github.owner = parseString(val, defGitHubOwner)
 		case "WAYBACK_GITHUB_REPO":
 			p.opts.github.repo = parseString(val, defGitHubRepo)
+		case "WAYBACK_NOTION_TOKEN":
+			p.opts.notion.token = parseString(val, defNotionToken)
+		case "WAYBACK_NOTION_DATABASE_ID":
+			p.opts.notion.databaseID = parseString(val, defNotionDatabaseID)
 		case "WAYBACK_IRC_NICK":
 			p.opts.irc.nick = parseString(val, defIRCNick)
+		case "WAYBACK_IRC_NAME":
+			p.opts.irc.name = parseString(val, defIRCName)
 		case "WAYBACK_IRC_PASSWORD":
 			p.opts.irc.password = parseString(val, defIRCPassword)
 		case "WAYBACK_IRC_CHANNEL":
@@ -167,14 +185,26 @@ func (p *Parser) parseLines(lines []string) (err error) {
 			p.opts.slack.channel = parseString(val, defSlackChannel)
 		case "WAYBACK_SLACK_HELPTEXT":
 			p.opts.slack.helptext = parseString(val, defSlackHelptext)
-		case "WAYBACK_TOR_PRIVKEY":
-			p.opts.tor.pvk = parseString(val, defTorPrivateKey)
-		case "WAYBACK_TOR_LOCAL_PORT":
-			p.opts.tor.localPort = parseInt(val, defTorLocalPort)
-		case "WAYBACK_TOR_REMOTE_PORTS":
-			p.opts.tor.remotePorts = parseIntList(val, defTorRemotePorts)
-		case "WAYBACK_TORRC":
-			p.opts.tor.torrcFile = parseString(val, defTorrcFile)
+		case "WAYBACK_XMPP_JID", "WAYBACK_XMPP_USERNAME":
+			p.opts.xmpp.username = parseString(val, defXMPPUsername)
+		case "WAYBACK_XMPP_PASSWORD":
+			p.opts.xmpp.password = parseString(val, defXMPPPassword)
+		case "WAYBACK_XMPP_NOTLS":
+			p.opts.xmpp.noTLS = parseBool(val, defXMPPNoTLS)
+		case "WAYBACK_XMPP_HELPTEXT":
+			p.opts.xmpp.helptext = parseString(val, defXMPPHelptext)
+		case "WAYBACK_NOSTR_RELAY_URL":
+			p.opts.nostr.url = parseString(val, defNostrRelayURL)
+		case "WAYBACK_NOSTR_PRIVATE_KEY":
+			p.opts.nostr.privateKey = parseString(val, defNostrPrivateKey)
+		case "WAYBACK_TOR_PRIVKEY", "WAYBACK_ONION_PRIVKEY":
+			p.opts.onion.pvk = parseString(val, defOnionPrivateKey)
+		case "WAYBACK_TOR_LOCAL_PORT", "WAYBACK_ONION_LOCAL_PORT":
+			p.opts.onion.localPort = parseInt(val, defOnionLocalPort)
+		case "WAYBACK_TOR_REMOTE_PORTS", "WAYBACK_ONION_REMOTE_PORTS":
+			p.opts.onion.remotePorts = parseIntList(val, defOnionRemotePorts)
+		case "WAYBACK_ONION_DISABLED":
+			p.opts.onion.disabled = parseBool(val, defOnionDisabled)
 		case "WAYBACK_POOLING_SIZE":
 			p.opts.poolingSize = parseInt(val, defPoolingSize)
 		case "WAYBACK_BOLT_PATH":
@@ -185,10 +215,20 @@ func (p *Parser) parseLines(lines []string) (err error) {
 			p.opts.maxMediaSize = parseString(val, defMaxMediaSize)
 		case "WAYBACK_TIMEOUT":
 			p.opts.waybackTimeout = parseInt(val, defWaybackTimeout)
+		case "WAYBACK_MAX_RETRIES":
+			p.opts.waybackMaxRetries = parseInt(val, defWaybackMaxRetries)
 		case "WAYBACK_USERAGENT":
 			p.opts.waybackUserAgent = parseString(val, defWaybackUserAgent)
 		case "WAYBACK_FALLBACK":
 			p.opts.waybackFallback = parseBool(val, defWaybackFallback)
+		case "WAYBACK_MEILI_ENDPOINT":
+			p.opts.meili.endpoint = parseString(val, defMeiliEndpoint)
+		case "WAYBACK_MEILI_INDEXING":
+			p.opts.meili.indexing = parseString(val, defMeiliIndexing)
+		case "WAYBACK_MEILI_APIKEY":
+			p.opts.meili.apikey = parseString(val, defMeiliApikey)
+		case "WAYBACK_OMNIVORE_APIKEY":
+			p.opts.omnivore.apikey = parseString(val, defOmnivoreApikey)
 		default:
 			if os.Getenv(key) == "" && val != "" {
 				os.Setenv(key, val)
@@ -244,10 +284,10 @@ func parseIntList(val string, fallback []int) []int {
 		return fallback
 	}
 
-	var intList []int
 	items := strings.Split(val, ",")
+	intList := make([]int, 0, len(items))
 	for _, item := range items {
-		i, _ := strconv.Atoi(strings.TrimSpace(item))
+		i, _ := strconv.Atoi(strings.TrimSpace(item)) // nolint:errcheck
 		intList = append(intList, i)
 	}
 
@@ -256,7 +296,7 @@ func parseIntList(val string, fallback []int) []int {
 
 func defaultFilenames() []string {
 	name := "wayback.conf"
-	home, _ := os.UserHomeDir()
+	home, _ := os.UserHomeDir() // nolint:errcheck
 	return []string{
 		name,
 		filepath.Join(home, name),

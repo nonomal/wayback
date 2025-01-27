@@ -5,119 +5,267 @@
 package pooling // import "github.com/wabarc/wayback/pooling"
 
 import (
+	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/phf/go-queue/queue"
 	"github.com/wabarc/logger"
-	"github.com/wabarc/wayback/config"
 	"github.com/wabarc/wayback/errors"
 )
-
-var maxTime = 5 * time.Minute
 
 var (
 	ErrPoolNotExist = errors.New("pool not exist")  // ErrPoolNotExist pool not exist
 	ErrTimeout      = errors.New("process timeout") // ErrTimeout process timeout
-)
 
-var q = queue.New()
+	errRollTimeout = errors.New("roll bucket timeout")
+	errElapsed     = errors.New("retried to reach maximum times")
+)
 
 type resource struct {
 	id int
 }
 
-// Pool handles a pool of services.
-type Pool chan *resource
+// Pool represents a pool of services.
+type Pool struct {
+	mutex    sync.Mutex
+	resource chan *resource
+	timeout  time.Duration
+	staging  queue.Queue
+
+	closed  chan bool
+	context context.Context
+
+	waiting    int32
+	processing int32
+	maxRetries uint64
+	multiplier float64
+}
+
+// A Bucket represents a wayback request is sent by a service.
+type Bucket struct {
+	// Request is the main func for handling wayback requests.
+	Request func(context.Context) error
+
+	// Fallback defines an optional func to return a failure response for the Request func.
+	Fallback func(context.Context) error
+
+	// Count of retried attempts
+	elapsed uint64
+
+	// An object that will perform exactly one action.
+	once *sync.Once
+}
 
 func newResource(id int) *resource {
 	return &resource{id: id}
 }
 
-// New a resource pool of the specified size
+// New a resource pool of the specified capacity
 // Resources are created concurrently to save resource initialization time
-func New(size int) Pool {
-	p := make(Pool, size)
+func New(ctx context.Context, options ...Option) *Pool {
+	var opts Options
+	for _, fn := range options {
+		fn(&opts)
+	}
+
+	p := new(Pool)
+	capacity := opts.Capacity
+	p.resource = make(chan *resource, capacity)
 	wg := new(sync.WaitGroup)
-	wg.Add(size)
-	for i := 0; i < size; i++ {
+	wg.Add(capacity)
+	for i := 0; i < capacity; i++ {
 		go func(resId int) {
-			p <- newResource(resId)
+			p.resource <- newResource(resId)
 			wg.Done()
 		}(i)
 	}
 	wg.Wait()
 
-	maxTime = config.Opts.WaybackTimeout() + 3*time.Second
+	p.closed = make(chan bool, 1)
+	p.timeout = opts.Timeout
+	p.maxRetries = opts.MaxRetries + 1
+	p.multiplier = 0.75
+	p.context = ctx
 
 	return p
 }
 
-// Roll wrapper service as function to the resource pool.
-func (p Pool) Roll(service func()) {
-	do := func(wg *sync.WaitGroup) {
-		defer wg.Done()
-		fn, ok := q.PopBack().(func())
-		if !ok {
-			logger.Error("pop service failed")
-			return
-		}
-
-		r, err := p.pull()
-		if err != nil {
-			logger.Error("pull resources failed: %v", err)
-			return
-		}
-
-		ch := make(chan bool, 1)
-		go func() {
-			logger.Debug("roll service func: %#v", fn)
-			fn()
-			ch <- true
-		}()
-
+// Roll process wayback requests from the resource pool for execution.
+func (p *Pool) Roll() {
+	// Blocks until closed
+	for {
 		select {
-		case <-ch:
-			logger.Info("roll service completed")
-		case <-time.After(maxTime):
-			logger.Warn("roll service timeout")
+		default:
+		case <-p.closed:
+			close(p.closed)
+			return
 		}
 
-		p.push(r)
-		logger.Debug("roll service completed on #%d", r.id)
+		// Waiting for new requests
+		if atomic.LoadInt32(&p.waiting) == 0 {
+			continue
+		}
+
+		if b, has := p.bucket(); has {
+			go b.once.Do(func() {
+				err := p.do(b)
+				if err != nil {
+					logger.Error("pooling do failed: %v", err)
+				}
+			})
+		}
 	}
-
-	// Inserts a new value service at the front of queue q.
-	q.PushFront(service)
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	// TODO: retry
-	go do(&wg)
-	wg.Wait()
 }
 
-func (p Pool) pull() (r *resource, err error) {
+// Put puts wayback requests to the resource pool
+func (p *Pool) Put(b Bucket) {
+	// Inserts a new bucket at the front of queue.
+	p.mutex.Lock()
+	p.staging.PushFront(b)
+	p.mutex.Unlock()
+	atomic.AddInt32(&p.waiting, 1)
+}
+
+// Close closes the worker pool, and it is blocked until all workers are idle.
+func (p *Pool) Close() {
+	var once sync.Once
+	for {
+		waiting := atomic.LoadInt32(&p.waiting)
+		processing := atomic.LoadInt32(&p.processing)
+		if p.resource != nil && waiting == 0 && processing == 0 {
+			once.Do(func() {
+				p.closed <- true
+			})
+			return
+		}
+	}
+}
+
+// Closed returns whether the pooling is closed. It uses a select with a
+// timeout of 3 seconds to check if the p.closed channel has been closed.
+func (p *Pool) Closed() bool {
 	select {
-	case r := <-p:
-		return r, nil
-	case <-time.After(maxTime):
-		return nil, ErrTimeout
+	case <-p.closed:
+		return true
+	case <-time.After(3 * time.Second):
+		return false
 	}
 }
 
-func (p Pool) push(r *resource) error {
+func (p *Pool) pull() *resource {
+	r := <-p.resource
+	return r
+}
+
+func (p *Pool) push(r *resource) error {
 	if p == nil {
 		return ErrPoolNotExist
 	}
-	p <- r
+	p.resource <- r
 	return nil
 }
 
-// Close closes worker pool
-func (p Pool) Close() {
-	if p != nil {
-		close(p)
+func (p *Pool) do(b Bucket) error {
+	atomic.AddInt32(&p.processing, 1)
+	defer func() {
+		atomic.AddInt32(&p.waiting, -1)
+		atomic.AddInt32(&p.processing, -1)
+	}()
+
+	action := func() error {
+		interval := float64(b.elapsed) * p.multiplier
+		timeout := p.timeout + p.timeout*time.Duration(interval)
+		ctx, cancel := context.WithTimeout(p.context, timeout)
+		defer cancel()
+
+		r := p.pull()
+		defer func() {
+			p.push(r) // nolint:errcheck
+			if b.elapsed >= p.maxRetries {
+				if b.Fallback != nil {
+					// nolint:errcheck
+					b.Fallback(ctx)
+				}
+			}
+		}()
+
+		ch := make(chan error, 1)
+		go func() {
+			if b.Request != nil {
+				ch <- b.Request(ctx)
+			}
+		}()
+
+		select {
+		case err := <-ch:
+			if err != nil {
+				atomic.AddUint64(&b.elapsed, 1)
+			}
+			close(ch)
+			return err
+		case <-ctx.Done():
+			atomic.AddUint64(&b.elapsed, 1)
+			return errRollTimeout
+		}
 	}
+
+	ran := uint64(1)
+	max := p.maxRetries
+	for ; ran <= max; ran++ {
+		err := action()
+		switch err {
+		case nil, errElapsed:
+			return err
+		case errRollTimeout:
+		}
+	}
+
+	return nil
+}
+
+func (p *Pool) bucket() (b Bucket, ok bool) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if b, ok = p.staging.PopBack().(Bucket); ok {
+		b.once = new(sync.Once)
+		return b, ok
+	}
+
+	return
+}
+
+type Status int
+
+const (
+	StatusIdle Status = iota
+	StatusBusy
+)
+
+// Status returns status of worker pool.
+func (p *Pool) Status() Status {
+	total := atomic.LoadInt32(&p.waiting) + atomic.LoadInt32(&p.processing)
+	if total == 0 {
+		return StatusIdle
+	}
+
+	if int(total) < cap(p.resource) {
+		return StatusIdle
+	}
+
+	return StatusBusy
+}
+
+// String returns description of status.
+func (s Status) String() string {
+	switch s {
+	case StatusIdle:
+		return "idle"
+	case StatusBusy:
+		return "busy"
+	}
+
+	return "unknown"
 }

@@ -20,10 +20,14 @@ import (
 	"github.com/wabarc/wayback/service"
 	"github.com/wabarc/wayback/storage"
 	"github.com/wabarc/wayback/template/render"
-	matrix "maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
+
+	matrix "maunium.net/go/mautrix"
 )
+
+// Interface guard
+var _ service.Servicer = (*Matrix)(nil)
 
 // ErrServiceClosed is returned by the Service's Serve method after a call to Shutdown.
 var ErrServiceClosed = errors.New("matrix: Service closed")
@@ -33,46 +37,44 @@ type Matrix struct {
 	sync.RWMutex
 
 	ctx    context.Context
-	pool   pooling.Pool
+	opts   *config.Options
+	pool   *pooling.Pool
 	client *matrix.Client
 	store  *storage.Storage
+	pub    *publish.Publish
 }
 
 // New Matrix struct.
-func New(ctx context.Context, store *storage.Storage, pool pooling.Pool) *Matrix {
-	if config.Opts.MatrixUserID() == "" || config.Opts.MatrixPassword() == "" || config.Opts.MatrixHomeserver() == "" {
-		logger.Fatal("missing required environment variable")
-	}
-	if store == nil {
-		logger.Fatal("must initialize storage")
-	}
-	if pool == nil {
-		logger.Fatal("must initialize pooling")
+func New(ctx context.Context, opts service.Options) (*Matrix, error) {
+	if !opts.Config.MatrixEnabled() {
+		return nil, errors.New("missing required environment variable, skipped")
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	client, err := matrix.NewClient(config.Opts.MatrixHomeserver(), "", "")
+	client, err := matrix.NewClient(opts.Config.MatrixHomeserver(), "", "")
 	if err != nil {
-		logger.Fatal("Dial Matrix client got unpredictable error: %v", err)
+		return nil, errors.Wrap(err, "dial Matrix client got unpredictable error")
 	}
 	_, err = client.Login(&matrix.ReqLogin{
 		Type:             matrix.AuthTypePassword,
-		Identifier:       matrix.UserIdentifier{Type: matrix.IdentifierTypeUser, User: config.Opts.MatrixUserID()},
-		Password:         config.Opts.MatrixPassword(),
+		Identifier:       matrix.UserIdentifier{Type: matrix.IdentifierTypeUser, User: opts.Config.MatrixUserID()},
+		Password:         opts.Config.MatrixPassword(),
 		StoreCredentials: true,
 	})
 	if err != nil {
-		logger.Fatal("Login to Matrix got unpredictable error: %v", err)
+		return nil, errors.Wrap(err, "login to Matrix got unpredictable error")
 	}
 
 	return &Matrix{
 		ctx:    ctx,
-		pool:   pool,
 		client: client,
-		store:  store,
-	}
+		store:  opts.Storage,
+		opts:   opts.Config,
+		pool:   opts.Pool,
+		pub:    opts.Publish,
+	}, nil
 }
 
 // Serve loop request direct messages from the Matrix server.
@@ -81,7 +83,7 @@ func (m *Matrix) Serve() error {
 	if m.client == nil {
 		return errors.New("Must initialize Matrix client.")
 	}
-	logger.Warn("Serving Matrix account: %s", config.Opts.MatrixUserID())
+	logger.Warn("Serving Matrix account: %s", m.opts.MatrixUserID())
 
 	syncer := m.client.Syncer.(*matrix.DefaultSyncer)
 	// Listen join room invite event from user
@@ -101,23 +103,32 @@ func (m *Matrix) Serve() error {
 			// Do not handle message event:
 			// 1. Sent by self
 			// 2. Message was deleted (when ev.Unsigned.RedactedBecause not nil)
-			if ev.Sender == id.UserID(config.Opts.MatrixUserID()) || ev.Unsigned.RedactedBecause != nil {
+			if ev.Sender == id.UserID(m.opts.MatrixUserID()) || ev.Unsigned.RedactedBecause != nil {
 				return
 			}
 			metrics.IncrementWayback(metrics.ServiceMatrix, metrics.StatusRequest)
-			m.pool.Roll(func() {
-				if err := m.process(ev); err != nil {
-					logger.Error("process request failure, error: %v", err)
-					metrics.IncrementWayback(metrics.ServiceMatrix, metrics.StatusFailure)
-				} else {
+			bucket := pooling.Bucket{
+				Request: func(ctx context.Context) error {
+					if err := m.process(ctx, ev); err != nil {
+						logger.Error("process request failure, error: %v", err)
+						// nolint:errcheck
+						m.reply(ev, service.MsgWaybackRetrying)
+						return err
+					}
 					metrics.IncrementWayback(metrics.ServiceMatrix, metrics.StatusSuccess)
-				}
-				// m.destroyRoom(ev.RoomID)
-			})
+					// m.destroyRoom(ev.RoomID)
+					return nil
+				},
+				Fallback: func(_ context.Context) error {
+					metrics.IncrementWayback(metrics.ServiceMatrix, metrics.StatusFailure)
+					return m.reply(ev, service.MsgWaybackTimeout)
+				},
+			}
+			m.pool.Put(bucket)
 		}(ev)
 	})
 	syncer.OnEventType(event.EventEncrypted, func(source matrix.EventSource, ev *event.Event) {
-		logger.Error("Unsupport encryption message")
+		logger.Error("Unsupported encryption message")
 		// logger.Debug("event: %v", ev)
 		// if err := m.process(context.Background(), ev); err != nil {
 		// 	logger.Error("process request failure, error: %v", err)
@@ -142,13 +153,14 @@ func (m *Matrix) Shutdown() error {
 	if m.client != nil {
 		// Stopping sync and logout all sessions
 		m.client.StopSync()
+		// nolint:errcheck
 		m.client.LogoutAll()
 	}
 
 	return nil
 }
 
-func (m *Matrix) process(ev *event.Event) error {
+func (m *Matrix) process(ctx context.Context, ev *event.Event) error {
 	if ev.Sender == "" {
 		logger.Warn("without sender")
 		return errors.New("Matrix: without sender")
@@ -167,7 +179,7 @@ func (m *Matrix) process(ev *event.Event) error {
 		return m.playback(ev)
 	}
 
-	urls := service.MatchURL(text)
+	urls := service.MatchURL(m.opts, text)
 	if len(urls) == 0 {
 		logger.Warn("archives failure, URL no found.")
 		// Redact message
@@ -175,45 +187,31 @@ func (m *Matrix) process(ev *event.Event) error {
 		return errors.New("Matrix: URL no found")
 	}
 
-	var bundles reduxer.Bundles
-	cols, err := wayback.Wayback(context.TODO(), &bundles, urls...)
-	if err != nil {
-		logger.Error("archives failure, %v", err)
-		return err
-	}
-	logger.Debug("bundles: %#v", bundles)
+	do := func(cols []wayback.Collect, rdx reduxer.Reduxer) error {
+		logger.Debug("reduxer: %#v", rdx)
 
-	body := render.ForReply(&render.Matrix{Cols: cols}).String()
-	content := &event.MessageEventContent{
-		FormattedBody: body,
-		Format:        event.FormatHTML,
-		// Body:          body,
-		// To:            id.UserID(ev.Sender),
-		MsgType: event.MsgText,
-	}
-	content.SetReply(ev)
-	if _, err := m.client.SendMessageEvent(ev.RoomID, event.EventMessage, content); err != nil {
-		logger.Error("send to Matrix room failure: %v", err)
-		return err
-	}
-	// Redact message
-	m.redact(ev, "Wayback completed. Original message: "+text)
+		body := render.ForReply(&render.Matrix{Cols: cols}).String()
+		if err := m.reply(ev, body); err != nil {
+			return errors.Wrap(err, "send to Matrix room failed")
+		}
+		// Redact message
+		m.redact(ev, "wayback completed. original message: "+text)
 
-	// Mark message as receipt
-	if err := m.client.MarkRead(ev.RoomID, ev.ID); err != nil {
-		logger.Error("mark message as receipt failure: %v", err)
+		// Mark message as receipt
+		if err := m.client.MarkRead(ev.RoomID, ev.ID); err != nil {
+			logger.Error("mark message as receipt failure: %v", err)
+		}
+
+		m.pub.Spread(ctx, rdx, cols, publish.FlagMatrix)
+		return nil
 	}
 
-	ctx := context.WithValue(m.ctx, publish.FlagMatrix, m.client)
-	ctx = context.WithValue(ctx, publish.PubBundle, bundles)
-	publish.To(ctx, cols, publish.FlagMatrix.String())
-
-	return nil
+	return service.Wayback(ctx, m.opts, urls, do)
 }
 
 func (m *Matrix) playback(ev *event.Event) error {
 	text := ev.Content.AsMessage().Body
-	urls := service.MatchURL(text)
+	urls := service.MatchURL(m.opts, text)
 	// Redact message
 	defer m.redact(ev, "URL no found. Original message: "+text)
 	if len(urls) == 0 {
@@ -221,24 +219,29 @@ func (m *Matrix) playback(ev *event.Event) error {
 		return errors.New("Matrix: URL no found")
 	}
 
-	cols, err := wayback.Playback(m.ctx, urls...)
+	cols, err := wayback.Playback(m.ctx, m.opts, urls...)
 	if err != nil {
-		logger.Error("playback failure, %v", err)
-		return err
+		return errors.Wrap(err, "matrix: playback failed")
 	}
 
 	body := render.ForReply(&render.Matrix{Cols: cols}).String()
+	if err := m.reply(ev, body); err != nil {
+		return errors.Wrap(err, "send to Matrix room failed")
+	}
+
+	return nil
+}
+
+func (m *Matrix) reply(ev *event.Event, msg string) error {
 	content := &event.MessageEventContent{
-		FormattedBody: body,
+		FormattedBody: msg,
 		Format:        event.FormatHTML,
 		MsgType:       event.MsgText,
 	}
 	content.SetReply(ev)
 	if _, err := m.client.SendMessageEvent(ev.RoomID, event.EventMessage, content); err != nil {
-		logger.Error("send to Matrix room failure: %v", err)
 		return err
 	}
-
 	return nil
 }
 
@@ -250,29 +253,4 @@ func (m *Matrix) redact(ev *event.Event, reason string) {
 	if _, err := m.client.RedactEvent(ev.RoomID, ev.ID, extra); err != nil {
 		logger.Error("react message failure, error: %v", err)
 	}
-}
-
-func (m *Matrix) joinedRooms() []id.RoomID {
-	var rooms []id.RoomID
-	if m.client == nil {
-		return rooms
-	}
-	resp, err := m.client.JoinedRooms()
-	if err != nil {
-		return rooms
-	}
-
-	return resp.JoinedRooms
-}
-
-func (m *Matrix) destroyRoom(roomID id.RoomID) {
-	if roomID == "" || m.client == nil {
-		return
-	}
-	if id.RoomID(config.Opts.MatrixRoomID()) == roomID {
-		return
-	}
-
-	m.client.LeaveRoom(roomID)
-	m.client.ForgetRoom(roomID)
 }

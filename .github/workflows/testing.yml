@@ -1,3 +1,7 @@
+# Copyright 2020 Wayback Archiver. All rights reserved.
+# Use of this source code is governed by the GNU GPL v3
+# license that can be found in the LICENSE file.
+#
 name: Testing
 
 on:
@@ -21,125 +25,185 @@ on:
       - "Makefile"
   workflow_dispatch:
 
-permissions: write-all
+permissions:
+  contents: read
+
+# New runs to only cancel in-progress runs of the same workflow.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   testing:
     name: Testing
+    permissions:
+      actions: write  # for styfle/cancel-workflow-action to cancel/stop running workflows
+      contents: read  # for actions/checkout to fetch code
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, macos-latest, windows-latest ]
-        go: [ "1.16", "1.17" ]
+        # The step `Set up Chrome` do not support arm64 yet, so specified s version to use amd64 arch
+        # Refs to https://github.com/actions/runner-images#available-images
+        os: [ ubuntu-24.04, macos-13, windows-2022 ]
+        go: [ "1.21", "1.22" ]
+        include:
+          # only update test coverage stats with the most recent go version on linux
+          - go: 1.x
+            os: ubuntu-latest
+            update-coverage: true
     env:
       SENDER_UID: ${{ secrets.MATRIX_SENDER_UID }}
       SENDER_PWD: ${{ secrets.MATRIX_SENDER_PWD }}
       RECVER_UID: ${{ secrets.MATRIX_RECVER_UID }}
       RECVER_PWD: ${{ secrets.MATRIX_RECVER_PWD }}
-      MATRIX_ROOMID: ${{ secrets.MATRIX_ROOMID }}
-      WAYBACK_DISCORD_BOT_TOKEN: ${{ secrets.WAYBACK_DISCORD_BOT_TOKEN }}
-      WAYBACK_DISCORD_CHANNEL: ${{ secrets.WAYBACK_DISCORD_CHANNEL }}
+      WAYBACK_IPFS_MODE: ${{ vars.WAYBACK_IPFS_MODE }}
+      WAYBACK_IPFS_HOST: ${{ vars.WAYBACK_IPFS_HOST }}
+      WAYBACK_IPFS_PORT: ${{ vars.WAYBACK_IPFS_PORT }}
     steps:
-    - name: Set up Go ${{ matrix.go }}.x
-      uses: actions/setup-go@v2
-      with:
-        go-version: ${{ matrix.go }}
+      - name: Harden Runner
+        uses: step-security/harden-runner@2e205a28d0e1da00c5f53b161f4067b052c61f34 # v1.5.0
+        with:
+          egress-policy: audit
+          disable-telemetry: true
 
-    - name: Set up IPFS
-      uses: ibnesayeed/setup-ipfs@master
-      with:
-        run_daemon: true
+      - name: Check out code base
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # v3.1.0
+        with:
+          fetch-depth: 0
 
-    - name: Set up Tor
-      uses: tor-actions/setup-tor@main
-      with:
-        daemon: true
+      - name: Check out code base
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # v3.1.0
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
 
-    - name: Set up Chrome
-      uses: browser-actions/setup-chrome@latest
-      with:
-        chrome-version: stable
+      - name: Set up Go ${{ matrix.go }}.x
+        uses: actions/setup-go@c4a742cab115ed795e34d4513e2cf7d472deb55f # v3.3.1
+        with:
+          go-version: ${{ matrix.go }}
 
-    - name: Set up Chocolatey
-      if: matrix.os == 'windows-latest'
-      uses: crazy-max/ghaction-chocolatey@v1
-      with:
-        args: -h
+      - name: Set up IPFS
+        uses: ibnesayeed/setup-ipfs@3e5452e358dfa43a0fb92496e96c82cf756be94a
+        with:
+          run_daemon: true
+          ipfs_version: ${{ vars.IPFS_VERSION }}
 
-    - name: Install Packages
-      if: matrix.os == 'ubuntu-latest'
-      shell: bash
-      run: |
-        # search package https://pkgs.org/
-        sudo add-apt-repository universe
-        sudo apt-get -y -qq update
-        sudo apt-get -y -qq install ffmpeg libwebp-dev youtube-dl
-        pip3 install you-get
-        echo "youtube-dl version $(youtube-dl --version)"
-        you-get --version
-        ffmpeg -version
+      - name: Set up Tor
+        uses: tor-actions/setup-tor@64121bc84235ab7038224e8ce08601efdb9bd8d9
+        with:
+          daemon: true
 
-    - name: Install Packages
-      if: matrix.os == 'macos-latest'
-      shell: bash
-      run: |
-        # search package https://brew.sh/
-        brew install --quiet ffmpeg webp youtube-dl you-get
-        echo "youtube-dl version $(youtube-dl --version)"
-        you-get --version
-        ffmpeg -version
+      - name: Set up Chrome
+        uses: browser-actions/setup-chrome@37c79b7f0199cec79c8b6a414e806d88c8662bdd
+        with:
+          chrome-version: stable
 
-    - name: Install Packages
-      if: matrix.os == 'windows-latest'
-      shell: bash
-      run: |
-        # search package https://community.chocolatey.org/packages
-        choco install --no-progress wget ffmpeg webp youtube-dl you-get
-        echo "youtube-dl version $(youtube-dl --version)"
-        you-get --version
-        ffmpeg -version
-        wget --help
+      - name: Set up Meilisearch
+        uses: wabarc/.github/meilisearch@0c62d131c3884390bd63a2b7650a21fe16581bfe
+        with:
+          master-key: ${{ vars.MEILISEARCH_APIKEY }}
+          version: ${{ vars.MEILISEARCH_VERSION }}
+          port: ${{ vars.MEILISEARCH_PORT }}
 
-    - name: Set environments
-      shell: bash
-      run: |
-        # Set env to enable reduxer
-        storage_dir=$GITHUB_WORKSPACE/.tmp
-        echo "WAYBACK_STORAGE_DIR=${storage_dir}" >> $GITHUB_ENV
-        # Append paths to environment path
-        # echo "$(which youtube-dl)" >> $GITHUB_PATH
-        # echo "$(which you-get)" >> $GITHUB_PATH
-        # echo "$(which ffmpeg)" >> $GITHUB_PATH
-        # echo "$(which wget)" >> $GITHUB_PATH
+      - name: Set up Chocolatey
+        if: matrix.os == 'windows-latest'
+        uses: crazy-max/ghaction-chocolatey@b59ffdb6594d2e2c36d9e1174e15ac799dd0a8f1 # v2.0.0
+        with:
+          args: -h
 
-    - name: Check out code base
-      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
+      - name: Install Packages for Linux
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          # search package https://pkgs.org/
+          sudo add-apt-repository universe
+          sudo apt-get -y -qq update
+          sudo apt-get -y -qq install ffmpeg webp yt-dlp
+          pip3 install you-get
+          echo "yt-dlp version $(yt-dlp --version)"
+          you-get --version
+          ffmpeg -version
 
-    - name: Check out code base
-      if: github.event_name == 'pull_request'
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-        ref: ${{ github.event.pull_request.head.sha }}
+      - name: Install Packages for MacOS
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          # search package https://brew.sh/
+          brew install --quiet ffmpeg webp youtube-dl you-get
+          echo "youtube-dl version $(youtube-dl --version)"
+          you-get --version
+          ffmpeg -version
 
-    - name: Get dependencies
-      run: |
-        go get -v -t -d ./...
+      - name: Install Packages for Windows
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          # search package https://community.chocolatey.org/packages
+          choco install --no-progress wget ffmpeg webp youtube-dl you-get
+          echo "youtube-dl version $(youtube-dl --version)"
+          you-get --version
+          ffmpeg -version
+          wget --help
 
-    - name: Run test
-      run: |
-        make test
-        make test-cover
+      - name: Set environments
+        shell: bash
+        run: |
+          ipfsMode="${{ vars.WAYBACK_IPFS_MODE }}"
+          echo "WAYBACK_IPFS_MODE=${ipfsMode:-daemon}" >> $GITHUB_ENV
+          # Set env to enable reduxer
+          echo "WAYBACK_STORAGE_DIR=${{ runner.temp }}" >> $GITHUB_ENV
+          # Append paths to environment path
+          # echo "$(which youtube-dl)" >> $GITHUB_PATH
+          # echo "$(which you-get)" >> $GITHUB_PATH
+          # echo "$(which ffmpeg)" >> $GITHUB_PATH
+          # echo "$(which wget)" >> $GITHUB_PATH
+          # Set environments for Meilisearch to enable reduxer
+          echo "WAYBACK_MEILI_ENDPOINT=${{ vars.WAYBACK_MEILI_ENDPOINT }}" >> $GITHUB_ENV
+          echo "PLAYBACK_MEILI_ENDPOINT=${{ vars.WAYBACK_MEILI_ENDPOINT }}" >> $GITHUB_ENV
+          echo "WAYBACK_MEILI_APIKEY=${{ vars.MEILISEARCH_APIKEY }}" >> $GITHUB_ENV
+          echo "PLAYBACK_MEILI_APIKEY=${{ vars.MEILISEARCH_APIKEY }}" >> $GITHUB_ENV
 
-    - name: Upload coverage
-      uses: actions/upload-artifact@v2
-      with:
-        name: coverage-${{ matrix.os }}
-        path: coverage.*
+      - name: Cache go module
+        uses: actions/cache@9b0c1fce7a93df8e3bb8926b0d6e9d89e92f20a7 # v3.0.11
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+            ~/Library/Caches/go-build
+            ~\AppData\Local\go-build
+            ~\go\pkg\mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
 
-    - name: Run integration test
-      run: make test-integration
+      - name: Get dependencies
+        run: |
+          go get -v -t -d ./...
+
+      - name: Run test
+        run: |
+          make test
+          make test-cover
+        shell: bash
+        env:
+          CHROMEDP_NO_SANDBOX: true
+          CHROMEDP_WSURLREADTIMEOUT: 60
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: coverage-${{ matrix.os }}-${{ matrix.go }}
+          path: coverage.*
+
+      - name: Upload coverage to Codecov
+        if: ${{ matrix.update-coverage }}
+        uses: codecov/codecov-action@81cd2dc8148241f03f5839d295e000b8f761e378 #v3.1.0
+
+      - name: Run integration test
+        run: make test-integration
+        env:
+          CHROMEDP_NO_SANDBOX: true
+          CHROMEDP_WSURLREADTIMEOUT: 60

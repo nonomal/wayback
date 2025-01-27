@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,7 +20,7 @@ import (
 	"github.com/wabarc/wayback/config"
 	"github.com/wabarc/wayback/pooling"
 	"github.com/wabarc/wayback/storage"
-	telegram "gopkg.in/tucnak/telebot.v2"
+	telegram "gopkg.in/telebot.v3"
 )
 
 var (
@@ -121,7 +122,8 @@ var (
 )
 
 func handle(mux *http.ServeMux, updatesJSON string) {
-	times := 0
+	var count int32
+	var edit int32
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -144,11 +146,11 @@ func handle(mux *http.ServeMux, updatesJSON string) {
 		case "setMyCommands":
 			fmt.Fprintln(w, `{"ok":true, "result":true}`)
 		case "getUpdates":
-			if times == 0 {
+			if count == 0 {
+				atomic.AddInt32(&count, 1)
 				fmt.Fprintln(w, updatesJSON)
-				times++
 			} else {
-				fmt.Fprintln(w, `{"ok":true, "result":[]}`)
+				fmt.Fprintln(w, `{"ok":true, "result":null}`)
 			}
 		case "sendMessage":
 			if text == "Queue..." || strings.Contains(text, config.SlotName("ia")) {
@@ -158,7 +160,12 @@ func handle(mux *http.ServeMux, updatesJSON string) {
 			}
 		case "editMessageText":
 			if strings.Contains(text, config.SlotName("ia")) || strings.Contains(text, "Archiving...") {
-				fmt.Fprintln(w, replyJSON)
+				atomic.AddInt32(&edit, 1)
+				if edit == 0 {
+					fmt.Fprintln(w, replyJSON)
+				} else {
+					fmt.Fprintln(w, fmt.Sprintf(`{"ok":true, "result":{"message":"%s"}}`, telegram.ErrSameMessageContent))
+				}
 			} else {
 				http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 			}
@@ -171,7 +178,7 @@ func handle(mux *http.ServeMux, updatesJSON string) {
 	})
 }
 
-func newTelegram(client *http.Client, endpoint string) (tg *Telegram, cancel context.CancelFunc, err error) {
+func newTelegram(client *http.Client, opts *config.Options, endpoint string) (tg *Telegram, cancel context.CancelFunc, err error) {
 	bot, err := telegram.NewBot(telegram.Settings{
 		URL:    endpoint,
 		Token:  token,
@@ -182,20 +189,20 @@ func newTelegram(client *http.Client, endpoint string) (tg *Telegram, cancel con
 		return tg, nil, err
 	}
 
-	store, e := storage.Open("")
+	store, e := storage.Open(opts, "")
 	if e != nil {
 		return tg, nil, e
 	}
+	cfg := []pooling.Option{
+		pooling.Capacity(opts.PoolingSize()),
+		pooling.Timeout(opts.WaybackTimeout()),
+		pooling.MaxRetries(opts.WaybackMaxRetries()),
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	pool := pooling.New(config.Opts.PoolingSize())
-	go func() {
-		select {
-		case <-ctx.Done():
-			pool.Close()
-		}
-	}()
+	pool := pooling.New(ctx, cfg...)
+	go pool.Roll()
 
-	tg = &Telegram{ctx: ctx, bot: bot, pool: pool, store: store}
+	tg = &Telegram{ctx: ctx, bot: bot, opts: opts, pool: pool, store: store}
 
 	return tg, cancel, nil
 }
@@ -205,23 +212,31 @@ func TestServe(t *testing.T) {
 		t.Skip("Skip test in short mode.")
 	}
 
+	helper.Unsetenv("WAYBACK_TELEGRAM_TOKEN", "WAYBACK_TELEGRAM_CHANNEL")
 	os.Setenv("WAYBACK_TELEGRAM_TOKEN", token)
 	os.Setenv("WAYBACK_TELEGRAM_CHANNEL", "bar")
 
-	var err error
 	parser := config.NewParser()
-	if config.Opts, err = parser.ParseEnvironmentVariables(); err != nil {
+	opts, err := parser.ParseEnvironmentVariables()
+	if err != nil {
 		t.Fatalf("Parse environment variables or flags failed, error: %v", err)
 	}
+	opts.EnableServices(config.ServiceTelegram.String())
 
 	httpClient, mux, server := helper.MockServer()
 	defer server.Close()
 	handle(mux, `{"ok":true, "result":[]}`)
 
-	pool := pooling.New(config.Opts.PoolingSize())
-	defer pool.Close()
+	cfg := []pooling.Option{
+		pooling.Capacity(opts.PoolingSize()),
+		pooling.Timeout(opts.WaybackTimeout()),
+		pooling.MaxRetries(opts.WaybackMaxRetries()),
+	}
+	ctx := context.Background()
+	pool := pooling.New(ctx, cfg...)
+	go pool.Roll()
 
-	tg, cancel, err := newTelegram(httpClient, server.URL)
+	tg, cancel, err := newTelegram(httpClient, opts, server.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,6 +248,7 @@ func TestServe(t *testing.T) {
 	time.AfterFunc(pollTick, func() {
 		tg.Shutdown()
 		time.Sleep(time.Second)
+		pool.Close()
 		cancel()
 	})
 
@@ -243,27 +259,28 @@ func TestServe(t *testing.T) {
 	}
 }
 
-func TestProcess(t *testing.T) {
+func TestWayback(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skip test in short mode.")
 	}
 
+	helper.Unsetenv("WAYBACK_TELEGRAM_TOKEN", "WAYBACK_TELEGRAM_CHANNEL", "WAYBACK_ENABLE_IA")
 	os.Setenv("WAYBACK_TELEGRAM_TOKEN", token)
 	os.Setenv("WAYBACK_TELEGRAM_CHANNEL", "bar")
 	os.Setenv("WAYBACK_ENABLE_IA", "true")
 
-	var err error
 	parser := config.NewParser()
-	if config.Opts, err = parser.ParseEnvironmentVariables(); err != nil {
+	opts, err := parser.ParseEnvironmentVariables()
+	if err != nil {
 		t.Fatalf("Parse environment variables or flags failed, error: %v", err)
 	}
+	opts.EnableServices(config.ServiceTelegram.String())
 
 	httpClient, mux, server := helper.MockServer()
 	defer server.Close()
 	handle(mux, getUpdatesJSON)
 
-	tg, cancel, err := newTelegram(httpClient, server.URL)
-	defer cancel()
+	tg, cancel, err := newTelegram(httpClient, opts, server.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +288,9 @@ func TestProcess(t *testing.T) {
 		t.Fatalf("Open storage failed: %v", err)
 	}
 	defer tg.store.Close()
+	defer cancel()
 
+	done := make(chan bool, 1)
 	tg.bot.Poller = telegram.NewMiddlewarePoller(tg.bot.Poller, func(update *telegram.Update) bool {
 		switch {
 		// case update.Callback != nil:
@@ -281,7 +300,7 @@ func TestProcess(t *testing.T) {
 			} else {
 				// Waiting for publish
 				time.Sleep(time.Second)
-				tg.Shutdown()
+				done <- true
 			}
 		default:
 			t.Log("Unhandle")
@@ -289,24 +308,36 @@ func TestProcess(t *testing.T) {
 		return true
 	})
 
-	time.AfterFunc(2*time.Minute, func() { tg.Shutdown() })
+	go func() {
+		tg.bot.Start()
+	}()
 
-	// Block until service closed
-	tg.bot.Start()
+	for {
+		select {
+		case <-done:
+			tg.pool.Close()
+			tg.Shutdown()
+			time.Sleep(3 * time.Second)
+			return
+		case <-time.After(time.Minute):
+			done <- true
+		}
+	}
 }
 
-func TestProcessPlayback(t *testing.T) {
+func TestPlayback(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skip test in short mode.")
 	}
 
+	helper.Unsetenv("WAYBACK_TELEGRAM_TOKEN", "WAYBACK_TELEGRAM_CHANNEL", "WAYBACK_ENABLE_IA")
 	os.Setenv("WAYBACK_TELEGRAM_TOKEN", token)
 	os.Setenv("WAYBACK_TELEGRAM_CHANNEL", "bar")
 	os.Setenv("WAYBACK_ENABLE_IA", "true")
 
-	var err error
 	parser := config.NewParser()
-	if config.Opts, err = parser.ParseEnvironmentVariables(); err != nil {
+	opts, err := parser.ParseEnvironmentVariables()
+	if err != nil {
 		t.Fatalf("Parse environment variables or flags failed, error: %v", err)
 	}
 
@@ -343,8 +374,7 @@ func TestProcessPlayback(t *testing.T) {
 	defer server.Close()
 	handle(mux, getUpdatesJSON)
 
-	tg, cancel, err := newTelegram(httpClient, server.URL)
-	defer cancel()
+	tg, cancel, err := newTelegram(httpClient, opts, server.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,6 +382,8 @@ func TestProcessPlayback(t *testing.T) {
 		t.Fatalf("Open storage failed: %v", err)
 	}
 	defer tg.store.Close()
+	defer tg.pool.Close()
+	defer cancel()
 
 	tg.bot.Poller = telegram.NewMiddlewarePoller(tg.bot.Poller, func(update *telegram.Update) bool {
 		switch {

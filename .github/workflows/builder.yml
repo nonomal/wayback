@@ -1,3 +1,7 @@
+# Copyright 2020 Wayback Archiver. All rights reserved.
+# Use of this source code is governed by the GNU GPL v3
+# license that can be found in the LICENSE file.
+#
 name: Builder
 
 on:
@@ -10,6 +14,7 @@ on:
       - "Makefile"
       - "build/**"
       - ".github/workflows/builder.yml"
+      - "snapcraft.yaml"
   pull_request:
     branches: "*"
     paths:
@@ -18,10 +23,13 @@ on:
       - "go.sum"
   workflow_dispatch:
 
-env:
-  PRODUCT: wayback
+permissions:
+  contents: read
 
-permissions: write-all
+# New runs to only cancel in-progress runs of the same workflow.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -80,67 +88,22 @@ jobs:
           - os: dragonfly
             arch: 386
       fail-fast: false
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    env:
-      GOOS: ${{ matrix.os }}
-      GOARCH: ${{ matrix.arch }}
-      GOARM: ${{ matrix.arm }}
-      GOMIPS: ${{ matrix.mips }}
-      GOMIPS64: ${{ matrix.mips64 }}
-      GOMIPSLE: ${{ matrix.mipsle }}
-    steps:
-    - name: Set up Go 1.x
-      uses: actions/setup-go@v2
-      with:
-        go-version: ^1.17
-
-    - name: Check out code base
-      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-
-    - name: Check out code base
-      if: github.event_name == 'pull_request'
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-        ref: ${{ github.event.pull_request.head.sha }}
-
-    - name: Cache go module
-      uses: actions/cache@v2
-      with:
-        path: ~/go/pkg/mod
-        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-        restore-keys: ${{ runner.os }}-go-
-
-    - name: Get dependencies
-      run: |
-        go get -v -t -d ./...
-
-    - name: Build binary
-      id: builder
-      run: |
-        ARGS="${GOOS}-${GOARCH}"
-        if [[ -n "${GOARM}" ]]; then
-          ARGS="${ARGS}v${GOARM}"
-        elif [[ -n "${GOMIPS}" ]]; then
-          ARGS="${ARGS}-${GOMIPS}"
-        elif [[ -n "${GOMIPS64}" ]]; then
-          ARGS="${ARGS}-${GOMIPS64}"
-        elif [[ -n "${GOMIPSLE}" ]]; then
-          ARGS="${ARGS}-${GOMIPSLE}"
-        fi
-        make ${ARGS}
-        echo "::set-output name=filename::${{ env.PRODUCT }}-${ARGS}"
-
-    - name: Upload binary artifacts
-      uses: actions/upload-artifact@v2
-      with:
-        name: ${{ steps.builder.outputs.filename }}
-        path: ./build/binary/${{ env.PRODUCT }}*
-        if-no-files-found: error
+    uses: wabarc/.github/.github/workflows/reusable-builder-go.yml@main
+    with:
+      product: wayback
+      go-version: '^1.19'
+      go-os: ${{ matrix.os }}
+      go-arch: ${{ matrix.arch }}
+      go-arm: ${{ matrix.arm }}
+      go-mips: ${{ matrix.mips }}
+      go-mips64: ${{ matrix.mips64 }}
+      go-mipsle: ${{ matrix.mipsle }}
+      artifact-path: ./build/binary/wayback*
+      egress-policy: audit
+    secrets:
+      wayback-ipfs-target: ${{ secrets.WAYBACK_IPFS_TARGET }}
+      wayback-ipfs-apikey: ${{ secrets.WAYBACK_IPFS_APIKEY }}
+      wayback-ipfs-secret: ${{ secrets.WAYBACK_IPFS_SECRET }}
 
   debpkg:
     name: Build deb
@@ -156,210 +119,73 @@ jobs:
             arch: arm64
             arm: 8
       fail-fast: false
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    env:
-      GOARCH: ${{ matrix.arch }}
-      GOARM: ${{ matrix.arm }}
-    steps:
-    - name: Check out code base
-      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-
-    - name: Check out code base
-      if: github.event_name == 'pull_request'
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-        ref: ${{ github.event.pull_request.head.sha }}
-
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@v1
-
-    - name: Build Debian package
-      id: builder
-      run: |
-        TARGET="${GOARCH}"
-        if [[ -n "${GOARM}" ]]; then
-          TARGET="${GOARCH}v${GOARM}"
-        fi
-        PKG_ARCH="${TARGET//v8}"
-        PKG_ARCH="${PKG_ARCH//32}"
-        make debian DEB_IMG_ARCH=${TARGET} PKG_ARCH=${PKG_ARCH}
-        echo "::set-output name=filename::${{ env.PRODUCT }}-deb-${PKG_ARCH}"
-
-    - name: Upload archived binary
-      uses: actions/upload-artifact@v2
-      with:
-        name: ${{ steps.builder.outputs.filename }}
-        path: build/package/${{ env.PRODUCT }}*.deb
-        if-no-files-found: error
+    uses: wabarc/.github/.github/workflows/reusable-builder-deb.yml@main
+    with:
+      product: wayback
+      go-arch: ${{ matrix.arch }}
+      go-arm: ${{ matrix.arm }}
+      artifact-path: build/package/wayback*.deb
+      egress-policy: audit
+    secrets:
+      wayback-ipfs-target: ${{ secrets.WAYBACK_IPFS_TARGET }}
+      wayback-ipfs-apikey: ${{ secrets.WAYBACK_IPFS_APIKEY }}
+      wayback-ipfs-secret: ${{ secrets.WAYBACK_IPFS_SECRET }}
 
   rpmpkg:
     name: Build RPM
-    runs-on: ubuntu-latest
-    steps:
-    - name: Check out code base
-      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-
-    - name: Check out code base
-      if: github.event_name == 'pull_request'
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-        ref: ${{ github.event.pull_request.head.sha }}
-
-    - name: Build RPM package
-      run: make rpm
-
-    - name: Upload archived binary
-      uses: actions/upload-artifact@v2
-      with:
-        name: ${{ env.PRODUCT }}-rpm
-        path: build/package/${{ env.PRODUCT }}*.rpm
-        if-no-files-found: error
+    uses: wabarc/.github/.github/workflows/reusable-builder-rpm.yml@main
+    with:
+      product: wayback
+      params: 'make rpm'
+      artifact-path: build/package/wayback*.rpm
+      egress-policy: audit
+    secrets:
+      wayback-ipfs-target: ${{ secrets.WAYBACK_IPFS_TARGET }}
+      wayback-ipfs-apikey: ${{ secrets.WAYBACK_IPFS_APIKEY }}
+      wayback-ipfs-secret: ${{ secrets.WAYBACK_IPFS_SECRET }}
+      wayback-signing-key: ${{ secrets.GEMFURY_SIGNING_KEY }}
+      wayback-signing-passpharse: ${{ secrets.GEMFURY_SIGNING_PASSPHARSE }}
 
   aurpkg:
     name: Build AUR
-    runs-on: ubuntu-latest
-    steps:
-    - name: Check out code base
-      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-        submodules: true
-
-    - name: Check out code base
-      if: github.event_name == 'pull_request'
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-        submodules: true
-        ref: ${{ github.event.pull_request.head.sha }}
-
-    - name: Build AUR package
-      run: |
-        make submodule
-        cd build/aur
-        make volume
-
-    - name: Upload artifact
-      uses: actions/upload-artifact@v2
-      with:
-        name: ${{ env.PRODUCT }}-aur
-        path: |
-          build/aur/.SRCINFO
-          build/aur/PKGBUILD
-          build/aur/${{ env.PRODUCT }}*.pkg.tar.zst
-        if-no-files-found: error
+    uses: wabarc/.github/.github/workflows/reusable-builder-aur.yml@main
+    with:
+      product: wayback
+      params: 'make submodule && cd build/aur && make volume'
+      artifact-path: |
+        build/aur/.SRCINFO
+        build/aur/PKGBUILD
+        build/aur/wayback*.pkg.tar.zst
+      egress-policy: audit
+    secrets:
+      wayback-ipfs-target: ${{ secrets.WAYBACK_IPFS_TARGET }}
+      wayback-ipfs-apikey: ${{ secrets.WAYBACK_IPFS_APIKEY }}
+      wayback-ipfs-secret: ${{ secrets.WAYBACK_IPFS_SECRET }}
 
   snapcraft:
-    name: Build snap
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        platform:
-          - i386
-          - amd64
-      fail-fast: false
-    steps:
-    - name: Check out code base
-      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-
-    - name: Check out code base
-      if: github.event_name == 'pull_request'
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-        ref: ${{ github.event.pull_request.head.sha }}
-
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@v1
-
-    - id: build
-      name: Build snap
-      uses: diddlesnaps/snapcraft-multiarch-action@v1
-      with:
-        architecture: ${{ matrix.platform }}
-        snapcraft-channel: edge
-
-    - name: Upload artifact
-      uses: actions/upload-artifact@v2
-      with:
-        name: ${{ env.PRODUCT }}-snap-${{ matrix.platform }}
-        path: ${{ steps.build.outputs.snap }}
-
-    - name: Install snap
-      shell: bash
-      run: |
-        sudo snap install --dangerous ${{ steps.build.outputs.snap }}
-        wayback --help
-
-    - name: Release Snap
-      uses: snapcore/action-publish@v1
-      if: github.repository == 'wabarc/wayback' && github.event_name == 'push'
-      with:
-        store_login: ${{ secrets.SNAPCRAFT_TOKEN }}
-        snap: ${{ steps.build.outputs.snap }}
-        release: edge
+    name: Build Snap
+    uses: wabarc/.github/.github/workflows/reusable-builder-snap.yml@main
+    with:
+      product: wayback
+      channel: stable
+      publish: ${{ github.repository == 'wabarc/wayback' && github.event_name == 'push' }}
+      egress-policy: audit
+    secrets:
+      wayback-ipfs-target: ${{ secrets.WAYBACK_IPFS_TARGET }}
+      wayback-ipfs-apikey: ${{ secrets.WAYBACK_IPFS_APIKEY }}
+      wayback-ipfs-secret: ${{ secrets.WAYBACK_IPFS_SECRET }}
+      snapcraft-token: ${{ secrets.SNAPCRAFT_TOKEN }}
 
   flatpak:
     name: Build Flatpak
-    runs-on: ubuntu-latest
-    steps:
-    - name: Check out code base
-      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-
-    - name: Check out code base
-      if: github.event_name == 'pull_request'
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-        ref: ${{ github.event.pull_request.head.sha }}
-
-    - name: Set up Go 1.x
-      uses: actions/setup-go@v2
-      with:
-        go-version: ^1.17
-
-    - name: Setup Flatpak
-      run: |
-        sudo apt-get -y -qq update
-        sudo apt-get install -y flatpak flatpak-builder
-
-    - name: Packaging flatpak
-      run: |
-        VERSION=edge
-        BUNDLE="org.wabarc.wayback_${VERSION}_x86_64.flatpak"
-        MANIFEST_PATH=$GITHUB_WORKSPACE/build/flatpak/org.wabarc.wayback.yml
-        RUNTIME_REPO="https://flathub.org/repo/flathub.flatpakrepo"
-        APP_ID="org.wabarc.wayback"
-        BRANCH="master"
-
-        flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-        flatpak install -y --noninteractive flathub org.freedesktop.Platform//20.08 org.freedesktop.Sdk//20.08
-
-        make build
-        mv build/binary/wayback build/flatpak/wayback
-
-        flatpak-builder --user --disable-rofiles-fuse --repo=repo --force-clean flatpak_app ${MANIFEST_PATH} --install-deps-from=flathub
-        flatpak build-bundle repo ${BUNDLE} --runtime-repo=${RUNTIME_REPO} ${APP_ID} ${BRANCH}
-        mv $GITHUB_WORKSPACE/org.wabarc.wayback_${VERSION}_x86_64.flatpak $GITHUB_WORKSPACE/org.wabarc.wayback-${VERSION}.x86_64.flatpak
-
-    - name: Upload artifact
-      uses: actions/upload-artifact@v2
-      with:
-        name: ${{ env.PRODUCT }}-flatpak
-        path: org.wabarc.wayback-*.x86_64.flatpak
+    uses: wabarc/.github/.github/workflows/reusable-builder-flatpak.yml@main
+    with:
+      product: wayback
+      version: edge
+      params: 'make build'
+      artifact-path: org.wabarc.wayback-*.x86_64.flatpak
+      egress-policy: audit
+    secrets:
+      wayback-ipfs-target: ${{ secrets.WAYBACK_IPFS_TARGET }}
+      wayback-ipfs-apikey: ${{ secrets.WAYBACK_IPFS_APIKEY }}
+      wayback-ipfs-secret: ${{ secrets.WAYBACK_IPFS_SECRET }}

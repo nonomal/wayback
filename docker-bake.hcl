@@ -1,12 +1,18 @@
 // Go version
 variable "GO_VERSION" {
-  default = "1.17"
+  default = "1.22"
 }
 
-target "go-version" {
-  args = {
-    GO_VERSION = GO_VERSION
-  }
+variable "WAYBACK_IPFS_TARGET" {
+  default = ""
+}
+
+variable "WAYBACK_IPFS_APIKEY" {
+  default = ""
+}
+
+variable "WAYBACK_IPFS_SECRET" {
+  default = ""
 }
 
 // GitHub reference as defined in GitHub Actions (eg. refs/head/master))
@@ -14,9 +20,12 @@ variable "GITHUB_REF" {
   default = ""
 }
 
-target "git-ref" {
+target "_common" {
   args = {
-    GIT_REF = GITHUB_REF
+    GO_VERSION = GO_VERSION
+    WAYBACK_IPFS_TARGET = WAYBACK_IPFS_TARGET
+    WAYBACK_IPFS_APIKEY = WAYBACK_IPFS_APIKEY
+    WAYBACK_IPFS_SECRET = WAYBACK_IPFS_SECRET
   }
 }
 
@@ -29,7 +38,17 @@ target "docker-metadata-action" {
   tags = ["wabarc/wayback:local"]
 }
 
+target "image" {
+  inherits = ["_common", "docker-metadata-action"]
+}
+
+target "image-local" {
+  inherits = ["image"]
+  output = ["type=docker"]
+}
+
 target "artifact" {
+  inherits = ["image"]
   output = ["./dist"]
 }
 
@@ -41,22 +60,12 @@ target "artifact-all" {
     "linux/arm/v6",
     "linux/arm/v7",
     "linux/arm64",
-    "linux/ppc64le",
-    "linux/s390x"
+    "linux/ppc64le"
   ]
 }
 
-target "image" {
-  inherits = ["docker-metadata-action"]
-}
-
-target "image-local" {
-  inherits = ["image"]
-  output = ["type=docker"]
-}
-
 target "release" {
-  inherits = ["docker-metadata-action"]
+  inherits = ["image"]
   context = "./"
   platforms = [
     "linux/386",
@@ -64,13 +73,12 @@ target "release" {
     "linux/arm/v6",
     "linux/arm/v7",
     "linux/arm64",
-    "linux/ppc64le",
-    "linux/s390x"
+    "linux/ppc64le"
   ]
 }
 
 target "bundle" {
-  inherits = ["docker-metadata-action"]
+  inherits = ["image"]
   context = "./"
   dockerfile = "./build/docker/Dockerfile.all"
   platforms = [
@@ -79,7 +87,6 @@ target "bundle" {
     "linux/arm/v6",
     "linux/arm/v7",
     "linux/arm64",
-    "linux/ppc64le",
-    "linux/s390x"
+    "linux/ppc64le"
   ]
 }

@@ -1,3 +1,17 @@
+# Copyright 2020 Wayback Archiver. All rights reserved.
+# Use of this source code is governed by the GNU GPL v3
+# license that can be found in the LICENSE file.
+#
 #.git
-.github
+.github/
+.semgrepignore
+build/binary
+#docs required by rpm build
+#docs/
+install.sh
+mkdocs.yml
 snapcraft.yaml
+requirements.txt
+renovate.json
+codecov.yml
+cosign.pub

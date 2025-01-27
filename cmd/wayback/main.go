@@ -1,3 +1,6 @@
+// Copyright 2020 Wayback Archiver. All rights reserved.
+// Use of this source code is governed by the GNU GPL v3
+// license that can be found in the LICENSE file.
 package main
 
 import (
@@ -8,6 +11,7 @@ import (
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/spf13/cobra"
+	"github.com/wabarc/helper"
 	"github.com/wabarc/logger"
 	"github.com/wabarc/wayback/config"
 	"github.com/wabarc/wayback/errors"
@@ -22,6 +26,7 @@ var (
 	is bool
 	ip bool
 	ph bool
+	ga bool
 
 	daemon []string
 
@@ -53,21 +58,23 @@ var (
 			return checkRequiredFlags(cmd)
 		},
 		Run: func(cmd *cobra.Command, args []string) {
-			handle(cmd, args)
+			run(cmd, args)
 		},
 		Version: version.Version,
 	}
 )
 
 func main() {
+	// nolint:errcheck
 	rootCmd.Execute()
 }
 
 func init() {
-	rootCmd.Flags().BoolVarP(&ia, "ia", "", false, "Wayback webpages to Internet Archive")
-	rootCmd.Flags().BoolVarP(&is, "is", "", false, "Wayback webpages to Archive Today")
-	rootCmd.Flags().BoolVarP(&ip, "ip", "", false, "Wayback webpages to IPFS")
-	rootCmd.Flags().BoolVarP(&ph, "ph", "", false, "Wayback webpages to Telegraph")
+	rootCmd.Flags().BoolVarP(&ia, "ia", "", true, "Wayback webpages to Internet Archive")
+	rootCmd.Flags().BoolVarP(&is, "is", "", true, "Wayback webpages to Archive Today")
+	rootCmd.Flags().BoolVarP(&ip, "ip", "", true, "Wayback webpages to IPFS")
+	rootCmd.Flags().BoolVarP(&ph, "ph", "", true, "Wayback webpages to Telegraph")
+	rootCmd.Flags().BoolVarP(&ga, "ga", "", true, "Wayback webpages to Ghostarchive")
 	rootCmd.Flags().StringSliceVarP(&daemon, "daemon", "d", []string{}, "Run as daemon service, supported services are telegram, web, mastodon, twitter, discord, slack, irc")
 	rootCmd.Flags().StringVarP(&host, "ipfs-host", "", "127.0.0.1", "IPFS daemon host, do not require, unless enable ipfs")
 	rootCmd.Flags().UintVarP(&port, "ipfs-port", "p", 5001, "IPFS daemon port")
@@ -123,6 +130,9 @@ func setToEnv(cmd *cobra.Command) {
 	if flags.Changed("ph") {
 		os.Setenv("WAYBACK_ENABLE_PH", fmt.Sprint(ph))
 	}
+	if flags.Changed("ga") {
+		os.Setenv("WAYBACK_ENABLE_GA", fmt.Sprint(ga))
+	}
 	if flags.Changed("token") {
 		os.Setenv("WAYBACK_TELEGRAM_TOKEN", token)
 	}
@@ -142,45 +152,43 @@ func setToEnv(cmd *cobra.Command) {
 		os.Setenv("WAYBACK_USE_TOR", fmt.Sprint(tor))
 	}
 	if flags.Changed("tor-key") {
-		os.Setenv("WAYBACK_TOR_PRIVKEY", torKey)
+		os.Setenv("WAYBACK_ONION_PRIVKEY", torKey)
 	}
 }
 
 // nolint:gocyclo
-func handle(cmd *cobra.Command, args []string) {
-	if !ia && !is && !ip && !ph {
+func run(cmd *cobra.Command, args []string) {
+	if !ia && !is && !ip && !ph && !ga {
 		ia, is, ip = true, true, true
 		os.Setenv("WAYBACK_ENABLE_IA", "true")
 		os.Setenv("WAYBACK_ENABLE_IS", "true")
 		os.Setenv("WAYBACK_ENABLE_IP", "true")
+		os.Setenv("WAYBACK_ENABLE_GA", "true")
 	}
 
 	setToEnv(cmd)
 	parser := config.NewParser()
 
-	if configFile != "" {
-		if len(daemon) > 0 {
-			logger.Info("Run wayback using configuration file")
-		}
-		if config.Opts, err = parser.ParseFile(configFile); err != nil {
-			logger.Fatal("Parse configuration file failed, error: %v", err)
-		}
+	var opts *config.Options
+	if _, err = parser.ParseFile(configFile); err != nil {
+		logger.Fatal("Parse configuration file failed, error: %v", err)
 	}
 
-	if config.Opts, err = parser.ParseEnvironmentVariables(); err != nil {
+	if opts, err = parser.ParseEnvironmentVariables(); err != nil {
 		logger.Fatal("Parse environment variables or flags failed, error: %v", err)
 	}
 
-	if !config.Opts.LogTime() {
+	if !opts.LogTime() {
 		logger.DisableTime()
 	}
 
-	logger.SetLogLevel(config.Opts.LogLevel())
-	if debug || config.Opts.HasDebugMode() {
+	logger.SetLogLevel(opts.LogLevel())
+	if debug || opts.HasDebugMode() {
+		profiling()
 		logger.EnableDebug()
 	}
 
-	if config.Opts.EnabledMetrics() {
+	if opts.EnabledMetrics() {
 		metrics.Gather = metrics.NewCollector()
 	}
 
@@ -190,18 +198,22 @@ func handle(cmd *cobra.Command, args []string) {
 	}
 
 	if print {
-		cmd.Println(spew.Sdump(config.Opts))
+		cmd.Println(spew.Sdump(opts))
 		return
 	}
+
+	args = append(args, split(helper.ReadStdin())...)
 
 	hasDaemon := len(daemon) > 0
 	hasArgs := len(args) > 0
 	switch {
 	case hasDaemon:
-		serve(cmd, args)
+		opts.EnableServices(daemon...)
+		serve(cmd, opts, args)
 	case hasArgs:
-		archive(cmd, args)
+		archive(cmd, opts, args)
 	default:
+		// nolint:errcheck
 		cmd.Help()
 	}
 	os.Exit(0)
@@ -215,4 +227,12 @@ func showInfo(cmd *cobra.Command) {
 	cmd.Println("Compiler:", runtime.Compiler)
 	cmd.Println("Arch:", runtime.GOARCH)
 	cmd.Println("OS:", runtime.GOOS)
+}
+
+func split(s []string) (ss []string) {
+	const space = ` `
+	for _, str := range s {
+		ss = append(ss, strings.Split(str, space)...)
+	}
+	return
 }

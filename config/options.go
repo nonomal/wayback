@@ -6,7 +6,11 @@ package config // import "github.com/wabarc/wayback/config"
 
 import (
 	"net/url"
+	"os"
+	"path"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -19,14 +23,19 @@ const (
 	defLogLevel = "info"
 	defMetrics  = false
 	defOverTor  = false
-	defIPFSHost = "127.0.0.1"
-	defIPFSPort = 4001
-	defIPFSMode = "pinner"
 
-	defEnabledIA = false
-	defEnabledIS = false
-	defEnabledIP = false
-	defEnabledPH = false
+	defIPFSHost   = "127.0.0.1"
+	defIPFSPort   = 5001
+	defIPFSMode   = "pinner"
+	defIPFSTarget = ""
+	defIPFSApikey = ""
+	defIPFSSecret = ""
+
+	defEnabledIA = true
+	defEnabledIS = true
+	defEnabledIP = true
+	defEnabledPH = true
+	defEnabledGA = true
 
 	defTelegramToken    = ""
 	defTelegramChannel  = ""
@@ -34,11 +43,15 @@ const (
 	defGitHubToken      = ""
 	defGitHubOwner      = ""
 	defGitHubRepo       = ""
+	defNotionToken      = ""
+	defNotionDatabaseID = ""
 
 	defMastodonServer        = "https://mastodon.social"
 	defMastodonClientKey     = ""
 	defMastodonClientSecret  = ""
 	defMastodonAccessToken   = ""
+	defMastodonCW            = false
+	defMastodonCWText        = "Wayback archive links"
 	defTwitterConsumerKey    = ""
 	defTwitterConsumerSecret = ""
 	defTwitterAccessToken    = ""
@@ -52,33 +65,58 @@ const (
 	defSlackHelptext         = "Hi there."
 
 	defIRCNick     = ""
+	defIRCName     = ""
 	defIRCPassword = ""
 	defIRCChannel  = ""
 	defIRCServer   = "irc.libera.chat:6697"
+
+	defXMPPUsername = ""
+	defXMPPPassword = ""
+	defXMPPNoTLS    = false
+	defXMPPHelptext = "Hi there."
 
 	defMatrixHomeserver = "https://matrix.org"
 	defMatrixUserID     = ""
 	defMatrixRoomID     = ""
 	defMatrixPassword   = ""
 
-	defTorPrivateKey = ""
-	defListenAddr    = "127.0.0.1:8964"
-	defTorLocalPort  = 8964
-	defTorrcFile     = "/etc/tor/torrc"
+	defNostrRelayURL   = "wss://nostr.developer.li"
+	defNostrPrivateKey = ""
+
+	defListenAddr      = "0.0.0.0:8964"
+	defOnionLocalPort  = 8964
+	defOnionPrivateKey = ""
+	defOnionDisabled   = false
 
 	defChromeRemoteAddr    = ""
 	defEnabledChromeRemote = false
 	defBoltPathname        = "wayback.db"
 	defPoolingSize         = 3
-	defStorageDir          = ""
 	defMaxMediaSize        = "512MB"
 	defWaybackTimeout      = 300
+	defWaybackMaxRetries   = 2
 	defWaybackUserAgent    = "WaybackArchiver/1.0"
 	defWaybackFallback     = false
+	defProxy               = ""
+
+	defMeiliEndpoint = ""
+	defMeiliIndexing = "capsules"
+	defMeiliApikey   = ""
+
+	defOmnivoreApikey = ""
+
+	maxAttachSizeTelegram = 50000000   // 50MB
+	maxAttachSizeDiscord  = 8000000    // 8MB
+	maxAttachSizeSlack    = 5000000000 // 5GB
 )
 
 var (
-	defTorRemotePorts = []int{80}
+	IPFSTarget = ""
+	IPFSApikey = ""
+	IPFSSecret = ""
+
+	defStorageDir       = path.Join(os.TempDir(), "reduxer")
+	defOnionRemotePorts = []int{80}
 )
 
 // Options represents a configuration options in the application.
@@ -89,6 +127,9 @@ type Options struct {
 	overTor  bool
 	metrics  bool
 
+	// Enabled services
+	services sync.Map
+
 	ipfs     *ipfs
 	slots    map[string]bool
 	telegram *telegram
@@ -96,10 +137,15 @@ type Options struct {
 	discord  *discord
 	twitter  *twitter
 	github   *github
+	notion   *notion
 	matrix   *matrix
 	slack    *slack
+	nostr    *nostr
 	irc      *irc
-	tor      *tor
+	onion    *onion
+	xmpp     *xmpp
+	omnivore *omnivore
+	meili    *meili
 
 	listenAddr          string
 	chromeRemoteAddr    string
@@ -108,15 +154,21 @@ type Options struct {
 	poolingSize         int
 	storageDir          string
 	maxMediaSize        string
+	proxy               string
 	waybackTimeout      int
+	waybackMaxRetries   int
 	waybackUserAgent    string
 	waybackFallback     bool
 }
 
 type ipfs struct {
 	host string
-	port uint
+	port int
 	mode string
+
+	target string
+	apikey string
+	secret string
 }
 
 type telegram struct {
@@ -130,6 +182,8 @@ type mastodon struct {
 	clientKey    string
 	clientSecret string
 	accessToken  string
+	cw           bool
+	cwText       string
 }
 
 type discord struct {
@@ -152,6 +206,11 @@ type github struct {
 	repo  string
 }
 
+type notion struct {
+	token      string
+	databaseID string
+}
+
 type matrix struct {
 	homeserver string
 	userID     string
@@ -166,19 +225,43 @@ type slack struct {
 	helptext string
 }
 
+type nostr struct {
+	url        string
+	privateKey string
+}
+
 type irc struct {
 	nick     string
+	name     string
 	password string
 	channel  string
 	server   string
 }
 
-type tor struct {
+type onion struct {
 	pvk string
 
 	localPort   int
 	remotePorts []int
-	torrcFile   string
+
+	disabled bool
+}
+
+type xmpp struct {
+	username string
+	password string
+	noTLS    bool
+	helptext string
+}
+
+type meili struct {
+	endpoint string
+	indexing string
+	apikey   string
+}
+
+type omnivore struct {
+	apikey string
 }
 
 // NewOptions returns Options with default values.
@@ -197,18 +280,23 @@ func NewOptions() *Options {
 		storageDir:          defStorageDir,
 		maxMediaSize:        defMaxMediaSize,
 		waybackTimeout:      defWaybackTimeout,
+		waybackMaxRetries:   defWaybackMaxRetries,
 		waybackUserAgent:    defWaybackUserAgent,
 		waybackFallback:     defWaybackFallback,
 		ipfs: &ipfs{
-			host: defIPFSHost,
-			port: defIPFSPort,
-			mode: defIPFSMode,
+			host:   defIPFSHost,
+			port:   defIPFSPort,
+			mode:   defIPFSMode,
+			target: defIPFSTarget,
+			apikey: defIPFSApikey,
+			secret: defIPFSSecret,
 		},
 		slots: map[string]bool{
 			SLOT_IA: defEnabledIA,
 			SLOT_IS: defEnabledIS,
 			SLOT_IP: defEnabledIP,
 			SLOT_PH: defEnabledPH,
+			SLOT_GA: defEnabledGA,
 		},
 		telegram: &telegram{
 			token:    defTelegramToken,
@@ -220,6 +308,8 @@ func NewOptions() *Options {
 			clientKey:    defMastodonClientKey,
 			clientSecret: defMastodonClientSecret,
 			accessToken:  defMastodonAccessToken,
+			cw:           defMastodonCW,
+			cwText:       defMastodonCWText,
 		},
 		discord: &discord{
 			appID:    defDiscordBotToken,
@@ -250,21 +340,75 @@ func NewOptions() *Options {
 			owner: defGitHubOwner,
 			repo:  defGitHubRepo,
 		},
+		notion: &notion{
+			token:      defNotionToken,
+			databaseID: defNotionDatabaseID,
+		},
+		nostr: &nostr{
+			url:        defNostrRelayURL,
+			privateKey: defNostrPrivateKey,
+		},
 		irc: &irc{
 			nick:     defIRCNick,
+			name:     defIRCName,
 			password: defIRCPassword,
 			channel:  defIRCChannel,
 			server:   defIRCServer,
 		},
-		tor: &tor{
-			pvk:         defTorPrivateKey,
-			localPort:   defTorLocalPort,
-			remotePorts: defTorRemotePorts,
-			torrcFile:   defTorrcFile,
+		onion: &onion{
+			localPort:   defOnionLocalPort,
+			remotePorts: defOnionRemotePorts,
+		},
+		xmpp: &xmpp{
+			username: defXMPPUsername,
+			password: defXMPPPassword,
+			noTLS:    defXMPPNoTLS,
+			helptext: defXMPPHelptext,
+		},
+		meili: &meili{
+			endpoint: defMeiliEndpoint,
+			indexing: defMeiliIndexing,
+			apikey:   defMeiliApikey,
+		},
+		omnivore: &omnivore{
+			apikey: defOmnivoreApikey,
 		},
 	}
 
 	return opts
+}
+
+func (o *Options) EnableServices(s ...string) {
+	for _, srv := range s {
+		switch strings.ToLower(srv) {
+		case ServiceDiscord.String():
+			o.services.Store(ServiceDiscord, true)
+		case ServiceHTTPd.String(), "web":
+			o.services.Store(ServiceHTTPd, true)
+		case ServiceMastodon.String(), "mstdn":
+			o.services.Store(ServiceMastodon, true)
+		case ServiceMatrix.String():
+			o.services.Store(ServiceMatrix, true)
+		case ServiceIRC.String(), "irc":
+			o.services.Store(ServiceIRC, true)
+		case ServiceSlack.String():
+			o.services.Store(ServiceSlack, true)
+		case ServiceTelegram.String():
+			o.services.Store(ServiceTelegram, true)
+		case ServiceTwitter.String():
+			o.services.Store(ServiceTwitter, true)
+		case ServiceXMPP.String():
+			o.services.Store(ServiceXMPP, true)
+		}
+	}
+}
+
+func (o *Options) isEnabled(f Flag) bool {
+	v, ok := o.services.Load(f)
+	if !ok {
+		return false
+	}
+	return v.(bool)
 }
 
 // HasDebugMode returns true if debug mode is enabled.
@@ -306,13 +450,40 @@ func (o *Options) IPFSHost() string {
 }
 
 // IPFSPort returns the port of IPFS daemon service.
-func (o *Options) IPFSPort() uint {
+func (o *Options) IPFSPort() int {
 	return o.ipfs.port
 }
 
 // IPFSMode returns the mode to using IPFS.
 func (o *Options) IPFSMode() string {
 	return o.ipfs.mode
+}
+
+// IPFSTarget returns which IPFS pinning service to use.
+// It returns a managed IPFS credential if env `WAYBACK_IPFS_TARGET` empty.
+func (o *Options) IPFSTarget() string {
+	if o.ipfs.target != "" {
+		return o.ipfs.target
+	}
+	return IPFSTarget
+}
+
+// IPFSApiKey returns the apikey of the IPFS pinning service.
+// It returns a managed IPFS credential if env `WAYBACK_IPFS_APIKEY` empty.
+func (o *Options) IPFSApikey() string {
+	if o.ipfs.apikey != "" {
+		return o.ipfs.apikey
+	}
+	return IPFSApikey
+}
+
+// IPFSSecret returns the secret of the IPFS pinning service.
+// It returns a managed IPFS credential if env `WAYBACK_IPFS_SECRET` empty.
+func (o *Options) IPFSSecret() string {
+	if o.ipfs.secret != "" {
+		return o.ipfs.secret
+	}
+	return IPFSSecret
 }
 
 // UseTor returns whether to use the Tor proxy when snapshot webpage.
@@ -354,6 +525,11 @@ func (o *Options) PublishToChannel() bool {
 	return o.telegram.token != "" && o.telegram.channel != ""
 }
 
+// TelegramEnabled returns whether enable Telegram service.
+func (o *Options) TelegramEnabled() bool {
+	return o.telegram.token != "" && o.isEnabled(ServiceTelegram)
+}
+
 // MastodonServer returns the domain of Mastodon instance.
 func (o *Options) MastodonServer() string {
 	if strings.HasPrefix(o.mastodon.server, "http://") || strings.HasPrefix(o.mastodon.server, "https://") {
@@ -373,7 +549,7 @@ func (o *Options) MastodonClientKey() string {
 	return o.mastodon.clientKey
 }
 
-// MastodonClientSecret returns the cilent secret of Mastodon application.
+// MastodonClientSecret returns the client secret of Mastodon application.
 func (o *Options) MastodonClientSecret() string {
 	return o.mastodon.clientSecret
 }
@@ -383,12 +559,30 @@ func (o *Options) MastodonAccessToken() string {
 	return o.mastodon.accessToken
 }
 
+// MastodonCW returns whether to enable content warning for publish to Mastodon.
+func (o *Options) MastodonCW() bool {
+	return o.mastodon.cw
+}
+
+// MastodonCWText returns the CW text for publish to Mastodon.
+func (o *Options) MastodonCWText() string {
+	if o.MastodonCW() {
+		return o.mastodon.cwText
+	}
+	return ""
+}
+
 // PublishToMastodon returns whether to publish result to Mastodon.
 func (o *Options) PublishToMastodon() bool {
 	return o.MastodonServer() != "" &&
 		o.MastodonClientKey() != "" &&
 		o.MastodonAccessToken() != "" &&
 		o.MastodonClientSecret() != ""
+}
+
+// MastodonEnabled returns whether enable Mastodon service.
+func (o *Options) MastodonEnabled() bool {
+	return o.PublishToMastodon() && o.isEnabled(ServiceMastodon)
 }
 
 // TwitterConsumerKey returns the consumer key of Twitter application.
@@ -419,6 +613,11 @@ func (o *Options) PublishToTwitter() bool {
 		o.TwitterAccessSecret() != ""
 }
 
+// TwitterEnabled returns whether enable Twitter service.
+func (o *Options) TwitterEnabled() bool {
+	return o.PublishToTwitter() && o.isEnabled(ServiceTwitter)
+}
+
 // GitHubToken returns the personal access token of GitHub account.
 func (o *Options) GitHubToken() string {
 	return o.github.token
@@ -444,6 +643,14 @@ func (o *Options) IRCNick() string {
 	return o.irc.nick
 }
 
+// IRCName returns name of IRC
+func (o *Options) IRCName() string {
+	if o.irc.name != "" {
+		return o.irc.name
+	}
+	return o.irc.nick
+}
+
 // IRCPassword returns password of IRC
 func (o *Options) IRCPassword() string {
 	return o.irc.password
@@ -451,6 +658,9 @@ func (o *Options) IRCPassword() string {
 
 // IRCChannel returns channel of IRC
 func (o *Options) IRCChannel() string {
+	if o.irc.channel == "" {
+		return ""
+	}
 	if strings.HasPrefix(o.irc.channel, "#") {
 		return o.irc.channel
 	}
@@ -465,6 +675,11 @@ func (o *Options) IRCServer() string {
 // PublishToIRCChannel returns whether publish results to IRC channel.
 func (o *Options) PublishToIRCChannel() bool {
 	return o.irc.nick != "" && o.irc.channel != ""
+}
+
+// IRCEnabled returns whether enable IRC service.
+func (o *Options) IRCEnabled() bool {
+	return o.irc.nick != "" && o.isEnabled(ServiceIRC)
 }
 
 // MatrixHomeserver returns the homeserver of Matrix.
@@ -505,6 +720,14 @@ func (o *Options) PublishToMatrixRoom() bool {
 		o.MatrixPassword() != ""
 }
 
+// MatrixEnabled returns whether enable Matrix service.
+func (o *Options) MatrixEnabled() bool {
+	return o.MatrixHomeserver() != "" &&
+		o.MatrixUserID() != "" &&
+		o.MatrixPassword() != "" &&
+		o.isEnabled(ServiceMatrix)
+}
+
 // DiscordBotToken returns the token of Discord bot
 func (o *Options) DiscordBotToken() string {
 	return o.discord.botToken
@@ -529,6 +752,11 @@ func (o *Options) DiscordHelptext() string {
 // PublishToDiscordChannel returns whether publish results to Discord channel.
 func (o *Options) PublishToDiscordChannel() bool {
 	return o.DiscordBotToken() != "" && o.DiscordChannel() != ""
+}
+
+// DiscordEnabled returns whether enable Discord service.
+func (o *Options) DiscordEnabled() bool {
+	return o.DiscordBotToken() != "" && o.isEnabled(ServiceDiscord)
 }
 
 // SlackAppToken returns the app-level token of Slack bot.
@@ -556,24 +784,85 @@ func (o *Options) PublishToSlackChannel() bool {
 	return o.SlackBotToken() != "" && o.SlackChannel() != ""
 }
 
-// TorPrivKey returns the private key of Tor service.
-func (o *Options) TorPrivKey() string {
-	return o.tor.pvk
+// SlackEnabled returns whether enable Slack service.
+func (o *Options) SlackEnabled() bool {
+	return o.SlackBotToken() != "" && o.isEnabled(ServiceSlack)
 }
 
-// TorLocalPort returns the local port to a TCP listener on.
-func (o *Options) TorLocalPort() int {
-	return o.tor.localPort
+// XMPPUsername returns the XMPP username (JID).
+func (o *Options) XMPPUsername() string {
+	return o.xmpp.username
 }
 
-// TorRemotePorts returns the remote ports to serve the Tor hidden service on.
-func (o *Options) TorRemotePorts() []int {
-	return o.tor.remotePorts
+// XMPPPassword returns the XMPP password.
+func (o *Options) XMPPPassword() string {
+	return o.xmpp.password
 }
 
-// TorrcFile returns path of the torrc file to set on start Tor Hidden Service.
-func (o *Options) TorrcFile() string {
-	return o.tor.torrcFile
+// XMPPNoTLS returns whether disable TLS.
+func (o *Options) XMPPNoTLS() bool {
+	return o.xmpp.noTLS
+}
+
+// XMPPHelptext returns the help text for XMPP.
+func (o *Options) XMPPHelptext() string {
+	return breakLine(o.xmpp.helptext)
+}
+
+// XMPPEnabled returns whether enable XMPP service.
+func (o *Options) XMPPEnabled() bool {
+	return o.XMPPUsername() != "" && o.XMPPPassword() != "" && o.isEnabled(ServiceXMPP)
+}
+
+// NotionToken returns the Notion integration token.
+func (o *Options) NotionToken() string {
+	return o.notion.token
+}
+
+// NotionDatabaseID returns the Notion's dabase id.
+func (o *Options) NotionDatabaseID() string {
+	return o.notion.databaseID
+}
+
+// PublishToNotion determines whether the results should be published on Notion.
+func (o *Options) PublishToNotion() bool {
+	return o.NotionToken() != "" && o.NotionDatabaseID() != ""
+}
+
+// NostrRelayURL returns the relay url of Nostr server.
+func (o *Options) NostrRelayURL() []string {
+	return strings.Split(o.nostr.url, ",")
+}
+
+// NostrPrivateKey returns the private key of Nostr account.
+func (o *Options) NostrPrivateKey() string {
+	return o.nostr.privateKey
+}
+
+// PublishToNostr determines whether the results should be published on Nostr.
+func (o *Options) PublishToNostr() bool {
+	return len(o.NostrRelayURL()) > 0 && o.NostrPrivateKey() != ""
+}
+
+// OnionPrivKey returns the private key of Onion service.
+func (o *Options) OnionPrivKey() string {
+	return o.onion.pvk
+}
+
+// OnionLocalPort returns the local port to a TCP listener on.
+// This is ignored if `WAYBACK_LISTEN_ADDR` is set.
+func (o *Options) OnionLocalPort() int {
+	return o.onion.localPort
+}
+
+// OnionRemotePorts returns the remote ports to serve the Onion hidden service on.
+func (o *Options) OnionRemotePorts() []int {
+	return o.onion.remotePorts
+}
+
+// OnionDisabled returns whether disable Onion service.
+func (o *Options) OnionDisabled() bool {
+	return o.onion.disabled
 }
 
 // ListenAddr returns the listen address for the HTTP server.
@@ -609,7 +898,7 @@ func (o *Options) StorageDir() string {
 
 // EnabledReduxer returns whether enable store binary file locally.
 func (o *Options) EnabledReduxer() bool {
-	return o.storageDir != ""
+	return o.StorageDir() != ""
 }
 
 // MaxMediaSize returns max size to limit download stream media.
@@ -625,9 +914,9 @@ func (o *Options) MaxMediaSize() uint64 {
 // scope: telegram
 func (o *Options) MaxAttachSize(scope string) int64 {
 	scopes := map[string]int64{
-		"telegram": 50000000,   // 50MB
-		"discord":  8000000,    // 8MB
-		"slack":    5000000000, // 5GB
+		"telegram": maxAttachSizeTelegram,
+		"discord":  maxAttachSizeDiscord,
+		"slack":    maxAttachSizeSlack,
 	}
 	return scopes[scope]
 }
@@ -635,6 +924,16 @@ func (o *Options) MaxAttachSize(scope string) int64 {
 // WaybackTimeout returns timeout for a wayback request.
 func (o *Options) WaybackTimeout() time.Duration {
 	return time.Duration(o.waybackTimeout) * time.Second
+}
+
+// WaybackMaxRetries returns max retries for a wayback request.
+func (o *Options) WaybackMaxRetries() uint64 {
+	s := strconv.Itoa(o.waybackMaxRetries)
+	u, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return u
 }
 
 // WaybackUserAgent returns User-Agent for a wayback request.
@@ -646,4 +945,44 @@ func (o *Options) WaybackUserAgent() string {
 // the original webpage is unavailable.
 func (o *Options) WaybackFallback() bool {
 	return o.waybackFallback
+}
+
+// MeiliEndpoint returns the Meilisearch API endpoint.
+func (o *Options) MeiliEndpoint() string {
+	return o.meili.endpoint
+}
+
+// MeiliIndexing returns the Meilisearch indexing name.
+func (o *Options) MeiliIndexing() string {
+	return o.meili.indexing
+}
+
+// MeiliApikey returns the Meilisearch admin apikey.
+func (o *Options) MeiliApikey() string {
+	return o.meili.apikey
+}
+
+// EnabledMeilisearch returns whether enable meilisearch server.
+func (o *Options) EnabledMeilisearch() bool {
+	return o.MeiliEndpoint() != ""
+}
+
+// OmnivoreApikey returns the Omnivore apikey.
+func (o *Options) OmnivoreApikey() string {
+	return o.omnivore.apikey
+}
+
+// EnabledOmnivore returns whether enable Omnivore.
+func (o *Options) EnabledOmnivore() bool {
+	return o.OmnivoreApikey() != ""
+}
+
+// HTTPdEnabled returns whether enable HTTP daemon service.
+func (o *Options) HTTPdEnabled() bool {
+	return o.isEnabled(ServiceHTTPd)
+}
+
+// Proxy returns the proxy server address.
+func (o *Options) Proxy() string {
+	return o.proxy
 }

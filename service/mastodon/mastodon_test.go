@@ -15,6 +15,8 @@ import (
 	"github.com/wabarc/helper"
 	"github.com/wabarc/wayback/config"
 	"github.com/wabarc/wayback/pooling"
+	"github.com/wabarc/wayback/publish"
+	"github.com/wabarc/wayback/service"
 	"github.com/wabarc/wayback/storage"
 )
 
@@ -55,13 +57,27 @@ func TestProcess(t *testing.T) {
 	os.Setenv("WAYBACK_MASTODON_TOKEN", "zoo")
 	os.Setenv("WAYBACK_ENABLE_IA", "true")
 
-	var err error
 	parser := config.NewParser()
-	if config.Opts, err = parser.ParseEnvironmentVariables(); err != nil {
+	opts, err := parser.ParseEnvironmentVariables()
+	if err != nil {
 		t.Fatalf("Parse environment variables or flags failed, error: %v", err)
 	}
+	opts.EnableServices(config.ServiceMastodon.String())
 
-	m := New(context.Background(), &storage.Storage{}, pooling.New(config.Opts.PoolingSize()))
+	cfg := []pooling.Option{
+		pooling.Capacity(opts.PoolingSize()),
+		pooling.Timeout(opts.WaybackTimeout()),
+		pooling.MaxRetries(opts.WaybackMaxRetries()),
+	}
+	ctx := context.Background()
+	pool := pooling.New(ctx, cfg...)
+	go pool.Roll()
+
+	pub := publish.New(ctx, opts)
+	defer pub.Stop()
+
+	o := service.ParseOptions(service.Config(opts), service.Storage(&storage.Storage{}), service.Pool(pool), service.Publish(pub))
+	m, _ := New(ctx, o)
 	noti, err := m.client.GetNotifications(m.ctx, nil)
 	if err != nil {
 		t.Fatalf("Mastodon: Get notifications failure, err: %v", err)
@@ -71,10 +87,11 @@ func TestProcess(t *testing.T) {
 	}
 
 	for _, n := range noti {
-		if err = m.process(n.ID, n.Status); err != nil {
+		if err = m.process(ctx, n.ID, n.Status); err != nil {
 			t.Fatalf("should not be fail: %v", err)
 		}
 	}
+	pool.Close()
 }
 
 func TestPlayback(t *testing.T) {
@@ -114,16 +131,27 @@ func TestPlayback(t *testing.T) {
 	os.Setenv("WAYBACK_MASTODON_TOKEN", "zoo")
 	os.Setenv("WAYBACK_ENABLE_IA", "true")
 
-	var err error
 	parser := config.NewParser()
-	if config.Opts, err = parser.ParseEnvironmentVariables(); err != nil {
+	opts, err := parser.ParseEnvironmentVariables()
+	if err != nil {
 		t.Fatalf("Parse environment variables or flags failed, error: %v", err)
 	}
+	opts.EnableServices(config.ServiceMastodon.String())
 
-	pool := pooling.New(config.Opts.PoolingSize())
-	defer pool.Close()
+	cfg := []pooling.Option{
+		pooling.Capacity(opts.PoolingSize()),
+		pooling.Timeout(opts.WaybackTimeout()),
+		pooling.MaxRetries(opts.WaybackMaxRetries()),
+	}
+	ctx := context.Background()
+	pool := pooling.New(ctx, cfg...)
+	go pool.Roll()
 
-	m := New(context.Background(), &storage.Storage{}, pool)
+	pub := publish.New(ctx, opts)
+	defer pub.Stop()
+
+	o := service.ParseOptions(service.Config(opts), service.Storage(&storage.Storage{}), service.Pool(pool), service.Publish(pub))
+	m, _ := New(ctx, o)
 	noti, err := m.client.GetNotifications(m.ctx, nil)
 	if err != nil {
 		t.Fatalf("Mastodon: Get notifications failure, err: %v", err)
@@ -133,8 +161,9 @@ func TestPlayback(t *testing.T) {
 	}
 
 	for _, n := range noti {
-		if err = m.process(n.ID, n.Status); err != nil {
+		if err = m.process(ctx, n.ID, n.Status); err != nil {
 			t.Fatalf("should not be fail: %v", err)
 		}
 	}
+	pool.Close()
 }

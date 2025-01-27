@@ -6,8 +6,9 @@ package slack // import "github.com/wabarc/wayback/service/slack"
 
 import (
 	"context"
+	"net/url"
 
-	"github.com/fatih/color"
+	"github.com/gookit/color"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
@@ -25,6 +26,9 @@ import (
 )
 
 var callbackKey = "playback"
+
+// Interface guard
+var _ service.Servicer = (*Slack)(nil)
 
 // ErrServiceClosed is returned by the Service's Serve method after a call to Shutdown.
 var ErrServiceClosed = errors.New("slack: Service closed")
@@ -57,7 +61,9 @@ type Slack struct {
 	bot    *slack.Client
 	client *socketmode.Client
 	store  *storage.Storage
-	pool   pooling.Pool
+	opts   *config.Options
+	pool   *pooling.Pool
+	pub    *publish.Publish
 }
 
 type event struct {
@@ -65,28 +71,22 @@ type event struct {
 }
 
 // New Slack struct.
-func New(ctx context.Context, store *storage.Storage, pool pooling.Pool) *Slack {
-	if config.Opts.SlackBotToken() == "" {
-		logger.Fatal("missing required environment variable")
-	}
-	if store == nil {
-		logger.Fatal("must initialize storage")
-	}
-	if pool == nil {
-		logger.Fatal("must initialize pooling")
+func New(ctx context.Context, opts service.Options) (*Slack, error) {
+	if !opts.Config.SlackEnabled() {
+		return nil, errors.New("missing required environment variable, skipped")
 	}
 	bot := slack.New(
-		config.Opts.SlackBotToken(),
-		// slack.OptionDebug(config.Opts.HasDebugMode()),
-		slack.OptionAppLevelToken(config.Opts.SlackAppToken()),
+		opts.Config.SlackBotToken(),
+		// slack.Config.OptionDebug(opts.Config.HasDebugMode()),
+		slack.OptionAppLevelToken(opts.Config.SlackAppToken()),
 	)
 	if bot == nil {
-		logger.Fatal("create slack bot instance failed")
+		return nil, errors.New("create slack bot instance failed")
 	}
 
 	client := socketmode.New(
 		bot,
-		// socketmode.OptionDebug(config.Opts.HasDebugMode()),
+		// socketmode.OptionDebug(opts.Config.HasDebugMode()),
 		// socketmode.OptionLog(log.New(os.Stdout, "socketmode: ", log.Lshortfile|log.LstdFlags)),
 	)
 
@@ -98,9 +98,11 @@ func New(ctx context.Context, store *storage.Storage, pool pooling.Pool) *Slack 
 		ctx:    ctx,
 		bot:    bot,
 		client: client,
-		store:  store,
-		pool:   pool,
-	}
+		store:  opts.Storage,
+		opts:   opts.Config,
+		pool:   opts.Pool,
+		pub:    opts.Publish,
+	}, nil
 }
 
 // Serve loop request message from the Slack api server.
@@ -113,7 +115,7 @@ func (s *Slack) Serve() (err error) {
 	if err != nil {
 		return err
 	}
-	logger.Info("authorized on account %s", color.BlueString(user.User))
+	logger.Info("authorized on account %s", color.Blue.Sprint(user.User))
 
 	go func() {
 		for evt := range s.client.Events {
@@ -139,7 +141,9 @@ func (s *Slack) Serve() (err error) {
 
 	logger.Info("starting slack service...")
 	// Block until context done
-	s.client.RunContext(s.ctx)
+	if err = s.client.RunContext(s.ctx); err != nil && err != context.Canceled {
+		return err
+	}
 
 	return ErrServiceClosed
 }
@@ -165,6 +169,7 @@ func (s *Slack) handleRequest(evt socketmode.Event) {
 		switch ev := innerEvent.Data.(type) {
 		case *slackevents.AppMentionEvent:
 			logger.Debug("channel mention message event: %+v", ev)
+			// nolint:errcheck
 			go s.process(&event{ev.User, ev.Text, ev.Channel, ev.TimeStamp, ev.ThreadTimeStamp})
 		case *slackevents.MessageEvent:
 			logger.Debug("direct message event: %+v", ev)
@@ -175,6 +180,7 @@ func (s *Slack) handleRequest(evt socketmode.Event) {
 				logger.Debug("skipped event from bot")
 				return
 			}
+			// nolint:errcheck
 			go s.process(&event{ev.User, ev.Text, ev.Channel, ev.TimeStamp, ev.ThreadTimeStamp})
 		}
 	default:
@@ -199,14 +205,15 @@ func (s *Slack) handleButton(evt socketmode.Event) {
 			// Process wayback request from a playback action
 			block := callback.ActionCallback.BlockActions[0]
 			logger.Debug("received wayback action: %+v", block)
+			// nolint:errcheck
 			go s.process(&event{callback.User.ID, block.Value, callback.Container.ChannelID, callback.Container.MessageTs, callback.Container.ThreadTs})
 		}
 	case slack.InteractionTypeViewSubmission:
 		// See https://api.slack.com/apis/connections/socket-implement#modal
 		logger.Debug("received view submission: %+v", callback.View)
+		// nolint:errcheck
 		s.playback(callback.View.ExternalID, callback.View.State.Values[callbackKey][callbackKey].Value, callback.TriggerID)
 	}
-	return
 }
 
 func (s *Slack) handleCommand(evt socketmode.Event) {
@@ -225,14 +232,14 @@ func (s *Slack) handleCommand(evt socketmode.Event) {
 				slack.NewSectionBlock(
 					&slack.TextBlockObject{
 						Type: slack.PlainTextType,
-						Text: config.Opts.SlackHelptext(),
+						Text: s.opts.SlackHelptext(),
 					},
 					nil, nil,
 				),
 			}}
 	case "/metrics":
 		stats := metrics.Gather.Export("wayback")
-		if config.Opts.EnabledMetrics() && stats != "" {
+		if s.opts.EnabledMetrics() && stats != "" {
 			payload = map[string]interface{}{
 				"blocks": []slack.Block{
 					slack.NewSectionBlock(
@@ -245,21 +252,22 @@ func (s *Slack) handleCommand(evt socketmode.Event) {
 				}}
 		}
 	case "/playback":
+		// nolint:errcheck
 		s.playback(cmd.ChannelID, cmd.Text, cmd.TriggerID)
 	default:
 	}
 	s.client.Ack(*evt.Request, payload)
-	return
 }
 
 func (s *Slack) process(ev *event) (err error) {
 	content := ev.Text
 	logger.Debug("content: %s", content)
 
-	urls := service.MatchURL(content)
+	urls := service.MatchURL(s.opts, content)
 
 	metrics.IncrementWayback(metrics.ServiceSlack, metrics.StatusRequest)
 	if len(urls) == 0 {
+		// nolint:errcheck
 		s.reply(ev, "URL no found.")
 		return errors.New("URL no found")
 	}
@@ -269,65 +277,77 @@ func (s *Slack) process(ev *event) (err error) {
 		logger.Error("reply queue failed: %v", err)
 		return
 	}
-	s.pool.Roll(func() {
-		if err := s.wayback(s.ctx, ev, urls); err != nil {
-			logger.Error("archives failed: %v", err)
+	bucket := pooling.Bucket{
+		Request: func(ctx context.Context) error {
+			if err := s.wayback(ctx, ev, urls); err != nil {
+				logger.Error("archives failed: %v", err)
+				// nolint:errcheck
+				s.edit(ev.Channel, ev.ThreadTimeStamp, service.MsgWaybackRetrying)
+				return err
+			}
+			metrics.IncrementWayback(metrics.ServiceSlack, metrics.StatusSuccess)
+			return nil
+		},
+		Fallback: func(_ context.Context) error {
+			replyText := service.MsgWaybackTimeout
+			// nolint:errcheck
+			s.edit(ev.Channel, ev.ThreadTimeStamp, replyText)
 			metrics.IncrementWayback(metrics.ServiceSlack, metrics.StatusFailure)
-			return
-		}
-		metrics.IncrementWayback(metrics.ServiceSlack, metrics.StatusSuccess)
-	})
+			return nil
+		},
+	}
+	s.pool.Put(bucket)
+
 	return nil
 }
 
-func (s *Slack) wayback(ctx context.Context, ev *event, urls []string) error {
+func (s *Slack) wayback(ctx context.Context, ev *event, urls []*url.URL) error {
 	tstamp, err := s.edit(ev.Channel, ev.ThreadTimeStamp, "Archiving...")
 	if err != nil {
 		logger.Error("send archiving message failed: %v", err)
 		return err
 	}
 
-	var bundles reduxer.Bundles
-	cols, err := wayback.Wayback(ctx, &bundles, urls...)
-	if err != nil {
-		logger.Error("archives failed: %v", err)
-		return err
-	}
-	logger.Debug("bundles: %#v", bundles)
+	do := func(cols []wayback.Collect, rdx reduxer.Reduxer) error {
+		logger.Debug("reduxer: %#v", rdx)
 
-	replyText := render.ForReply(&render.Slack{Cols: cols, Data: bundles}).String()
-	logger.Debug("reply text, %s", replyText)
+		replyText := render.ForReply(&render.Slack{Cols: cols, Data: rdx}).String()
+		logger.Debug("reply text, %s", replyText)
 
-	if _, err := s.edit(ev.Channel, tstamp, replyText); err != nil {
-		logger.Error("update message failed: %v", err)
-		return err
-	}
-
-	ctx = context.WithValue(ctx, publish.FlagSlack, s.bot)
-	ctx = context.WithValue(ctx, publish.PubBundle, bundles)
-	go publish.To(ctx, cols, publish.FlagSlack.String())
-
-	for _, bundle := range bundles {
-		if err := publish.UploadToSlack(s.bot, bundle, ev.Channel, ev.TimeStamp); err != nil {
-			logger.Error("upload files to slack failed: %v", err)
+		if _, err := s.edit(ev.Channel, tstamp, replyText); err != nil {
+			logger.Error("update message failed: %v", err)
+			return err
 		}
+
+		s.pub.Spread(ctx, rdx, cols, publish.FlagSlack)
+
+		var head = render.Title(cols, rdx)
+
+		for _, u := range urls {
+			if b, ok := rdx.Load(reduxer.Src(u.String())); ok {
+				if err := service.UploadToSlack(s.bot, s.opts, b.Artifact(), ev.Channel, ev.TimeStamp, head); err != nil {
+					logger.Error("upload files to slack failed: %v", err)
+				}
+			}
+		}
+		return nil
 	}
 
-	return nil
+	return service.Wayback(ctx, s.opts, urls, do)
 }
 
 func (s *Slack) playback(channel, text, triggerID string) error {
 	logger.Debug("channel %s, playback text %s, trigger id: %s", channel, text, triggerID)
 	metrics.IncrementPlayback(metrics.ServiceSlack, metrics.StatusRequest)
 
-	urls := service.MatchURL(text)
+	urls := service.MatchURL(s.opts, text)
 	if len(urls) == 0 {
 		// Only the inputs in input blocks will be included in view_submission’s view.state.values: https://slack.dev/java-slack-sdk/guides/modals
+		playbackHint := slack.NewTextBlockObject(slack.PlainTextType, "Playback URLs", false, false)
 		playbackNameText := slack.NewTextBlockObject(slack.PlainTextType, "URLs", false, false)
 		playbackPlaceholder := slack.NewTextBlockObject(slack.PlainTextType, "Please send me URLs to playback...", false, false)
 		playbackNameElement := slack.NewPlainTextInputBlockElement(playbackPlaceholder, callbackKey)
-		playbackNameBlock := slack.NewInputBlock(callbackKey, playbackNameText, playbackNameElement)
-		// playbackNameBlock.Hint = slack.NewTextBlockObject(slack.PlainTextType, "Playback URLs", false, false)
+		playbackNameBlock := slack.NewInputBlock(callbackKey, playbackNameText, playbackHint, playbackNameElement)
 		blocks := slack.Blocks{
 			BlockSet: []slack.Block{playbackNameBlock},
 		}
@@ -364,7 +384,8 @@ func (s *Slack) playback(channel, text, triggerID string) error {
 	}
 
 	go func() {
-		cols, _ := wayback.Playback(s.ctx, urls...)
+		// nolint:errcheck
+		cols, _ := wayback.Playback(s.ctx, s.opts, urls...)
 		logger.Debug("playback collections: %#v", cols)
 
 		replyText := render.ForReply(&render.Slack{Cols: cols}).String()

@@ -2,7 +2,7 @@
 
 [![LICENSE](https://img.shields.io/github/license/wabarc/wayback.svg?color=green)](https://github.com/wabarc/wayback/blob/main/LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/wabarc/wayback)](https://goreportcard.com/report/github.com/wabarc/wayback)
-[![GitHub Workflow Status](https://img.shields.io/github/workflow/status/wabarc/wayback/Go?color=brightgreen)](https://github.com/wabarc/wayback/actions)
+[![Test Coverage](https://codecov.io/gh/wabarc/wayback/branch/main/graph/badge.svg)](https://codecov.io/gh/wabarc/wayback)
 [![Go Reference](https://img.shields.io/badge/godoc-reference-blue.svg)](https://pkg.go.dev/github.com/wabarc/wayback)
 [![Releases](https://img.shields.io/github/v/release/wabarc/wayback.svg?include_prereleases&color=blue)](https://github.com/wabarc/wayback/releases)
 
@@ -11,38 +11,49 @@
 [![Matrix Bot](https://img.shields.io/badge/Matrix-bot-0a976f.svg)](https://matrix.to/#/@wabarc_bot:matrix.org)
 [![Matrix Room](https://img.shields.io/badge/Matrix-room-0a976f.svg)](https://matrix.to/#/#wabarc:matrix.org)
 [![Tor Hidden Service](https://img.shields.io/badge/Tor%20Hidden%20Service-472756.svg)](http://wabarcoww2bxmdbixj7sjwggv3fonh2rpflfiildegcydk5udkdckdyd.onion/)
-[![World Wide Web](https://img.shields.io/badge/Web-15aabf.svg)](https://initium.eu.org/)
+[![World Wide Web](https://img.shields.io/badge/Web-15aabf.svg)](https://wabarc.eu.org/)
+[![Nostr](https://img.shields.io/badge/Nostr-8e44ad.svg)](https://iris.to/#/profile/npub1gm4xeu8wlt6aa56zenutkwa0ppjng5axsscv424d0xvv5jalxxzs4hjukz)
 
-Wayback is a tool that supports running as a command-line tool and docker container, purpose to snapshot webpage to time capsules.
-
-Supported Golang version: See [.github/workflows/testing.yml](./.github/workflows/testing.yml)
+Wayback is a web archiving and playback tool that allows users to capture and preserve web content. It provides an IM-style interface for receiving and presenting archived web content, and a search and playback service for retrieving previously archived pages. Wayback is designed to be used by web archivists, researchers, and anyone who wants to preserve web content and access it in the future.
 
 ## Features
 
-- Cross platform
-- Batch wayback URLs
-- Builtin CLI (`wayback`)
-- Serve as Tor Hidden Service or local web entry
-- Wayback to Internet Archive, archive.today, IPFS and Telegraph easier
-- Interactive with IRC, Martix, Telegram bot, Discord bot, Mastodon and Twitter as daemon service
-- Supports publish wayback results to Telegram channel, Mastodon and GitHub Issues
-- Supports store archived files to disk
-- Download stream media (requires [FFmpeg](https://ffmpeg.org/))
+- Free and open-source
+- Expose prometheus metrics
+- Cross-platform compatibility
+- Batch wayback URLs for faster archiving
+- Built-in CLI (`wayback`) for convenient use
+- Serve as a Tor Hidden Service or local web entry for added privacy and accessibility
+- Easier wayback to Internet Archive, archive.today, IPFS and Telegraph integration
+- Interactive with IRC, Matrix, Telegram bot, Discord bot, Mastodon, Twitter, and XMPP as a daemon service for convenient use
+- Supports publishing wayback results to Telegram channel, Mastodon, and GitHub Issues for sharing
+- Supports storing archived files to disk for offline use
+- Download streaming media (requires [FFmpeg](https://ffmpeg.org/)) for convenient media archiving.
 
-## Installation
+## Getting Started
+
+For a comprehensive guide, please refer to the complete [documentation](https://docs.wabarc.eu.org/).
+
+### Installation
 
 The simplest, cross-platform way is to download from [GitHub Releases](https://github.com/wabarc/wayback/releases) and place the executable file in your PATH.
 
 From source:
 
 ```sh
-go get -u github.com/wabarc/wayback/cmd/wayback
+go install github.com/wabarc/wayback/cmd/wayback@latest
 ```
 
-From [GoBinaries](https://gobinaries.com/):
+From GitHub Releases:
 
 ```sh
-curl -sf https://gobinaries.com/wabarc/wayback/cmd/wayback | sh
+curl -fsSL https://get.wabarc.eu.org | sh
+```
+
+or via [Bina](https://bina.egoist.dev/):
+
+```sh
+curl -fsSL https://bina.egoist.dev/wabarc/wayback | sh
 ```
 
 Using [Snapcraft](https://snapcraft.io/wayback) (on GNU/Linux)
@@ -51,27 +62,29 @@ Using [Snapcraft](https://snapcraft.io/wayback) (on GNU/Linux)
 sudo snap install wayback
 ```
 
-Via [APT](https://github.com/wabarc/apt-repo):
+Via [APT](https://repo.wabarc.eu.org/deb:wayback):
 
 ```bash
-curl -s https://apt.wabarc.eu.org/KEY.gpg | sudo apt-key add -
-sudo echo "deb https://apt.wabarc.eu.org/ /" > /etc/apt/sources.list.d/wayback.list
+curl -fsSL https://repo.wabarc.eu.org/apt/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/packages.wabarc.gpg
+echo "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/packages.wabarc.gpg] https://repo.wabarc.eu.org/apt/ /" | sudo tee /etc/apt/sources.list.d/wayback.list
 sudo apt update
 sudo apt install wayback
 ```
 
-Via [RPM](https://github.com/wabarc/rpm-repo):
+Via [RPM](https://repo.wabarc.eu.org/rpm:wayback):
 
 ```bash
-sudo cat > /etc/yum.repos.d/wayback.repo<< EOF
+sudo rpm --import https://repo.wabarc.eu.org/yum/gpg.key
+sudo tee /etc/yum.repos.d/wayback.repo > /dev/null <<EOT
 [wayback]
-name=Wayback Repository
-baseurl=https://rpm.wabarc.eu.org/x86_64/
+name=Wayback Archiver
+baseurl=https://repo.wabarc.eu.org/yum/
 enabled=1
-gpgcheck=0
-EOF
+gpgcheck=1
+gpgkey=https://repo.wabarc.eu.org/yum/gpg.key
+EOT
 
-sudo yum install -y wayback
+sudo dnf install -y wayback
 ```
 
 Via [Homebrew](https://github.com/wabarc/homebrew-wayback):
@@ -81,9 +94,9 @@ brew tap wabarc/wayback
 brew install wayback
 ```
 
-## Usage
+### Usage
 
-### Command line
+#### Command line
 
 ```sh
 $ wayback -h
@@ -104,7 +117,7 @@ Examples:
 Flags:
       --chatid string      Telegram channel id
   -c, --config string      Configuration file path, defaults: ./wayback.conf, ~/wayback.conf, /etc/wayback.conf
-  -d, --daemon strings     Run as daemon service, supported services are telegram, web, mastodon, twitter, discord, slack, irc
+  -d, --daemon strings     Run as daemon service, supported services are telegram, web, mastodon, twitter, discord, slack, irc, xmpp
       --debug              Enable debug mode (default mode is false)
   -h, --help               help for wayback
       --ia                 Wayback webpages to Internet Archive
@@ -185,84 +198,25 @@ Both serve on Telegram and Tor hidden service:
 wayback -d telegram -t YOUT-BOT-TOKEN -d web
 ```
 
+URLs from file:
+
+```sh
+wayback url.txt
+```
+
+```sh
+cat url.txt | wayback
+```
+
 #### Configuration Parameters
 
-By default, `wayback` looks for configuration options from this files, the following are parsed:
+Look at the [full list of configuration options](docs/environment.md).
 
-- `./wayback.conf`
-- `~/wayback.conf`
-- `/etc/wayback.conf`
+## Deployment
 
-Use the `-c` / `--config` option to specify the build definition file to use.
-
-You can also specify configuration options either via command flags or via environment variables, an overview of all options below.
-
-| Flags               | Environment Variable              | Default                 | Description                                                  |
-| ------------------- | --------------------------------- | ----------------------- | ------------------------------------------------------------ |
-| `--debug`           | `DEBUG`                           | `false`                 | Enable debug mode, override `LOG_LEVEL`                      |
-| `-c`, `--config`    | -                                 | -                       | Configuration file path, defaults: `./wayback.conf`, `~/wayback.conf`, `/etc/wayback.conf` |
-| -                   | `LOG_TIME`                        | `true`                  | Display the date and time in log messages                    |
-| -                   | `LOG_LEVEL`                       | `info`                  | Log level, supported level are `debug`, `info`, `warn`, `error`, `fatal`, defaults to `info` |
-| -                   | `ENABLE_METRICS`                  | `false`                 | Enable metrics collector                                     |
-| -                   | `HTTP_LISTEN_ADDR`                | `127.0.0.1:8964`        | The listen address for the HTTP server                       |
-| -                   | `CHROME_REMOTE_ADDR`              | -                       | Chrome/Chromium remote debugging address, for screenshot     |
-| -                   | `WAYBACK_POOLING_SIZE`            | `3`                     | Number of worker pool for wayback at once                    |
-| -                   | `WAYBACK_BOLT_PATH`               | `./wayback.db`          | File path of bolt database                                   |
-| -                   | `WAYBACK_STORAGE_DIR`             | -                       | Directory to store binary file, e.g. PDF, html file          |
-| -                   | `WAYBACK_MAX_MEDIA_SIZE`          | `512MB`                 | Max size to limit download stream media                      |
-| -                   | `WAYBACK_TIMEOUT`                 | `300`                   | Timeout for single wayback request, defaults to 300 second   |
-| -                   | `WAYBACK_USERAGENT`               | `WaybackArchiver/1.0`   | User-Agent for a wayback request                             |
-| -                   | `WAYBACK_FALLBACK`                | `off`                   | Use Google cache as a fallback if the original webpage is unavailable |
-| `-d`, `--daemon`    | -                                 | -                       | Run as daemon service, e.g. `telegram`, `web`, `mastodon`, `twitter`, `discord` |
-| `--ia`              | `WAYBACK_ENABLE_IA`               | `true`                  | Wayback webpages to **Internet Archive**                     |
-| `--is`              | `WAYBACK_ENABLE_IS`               | `true`                  | Wayback webpages to **Archive Today**                        |
-| `--ip`              | `WAYBACK_ENABLE_IP`               | `false`                 | Wayback webpages to **IPFS**                                 |
-| `--ph`              | `WAYBACK_ENABLE_PH`               | `false`                 | Wayback webpages to **[Telegra.ph](https://telegra.ph)**, required Chrome/Chromium |
-| `--ipfs-host`       | `WAYBACK_IPFS_HOST`               | `127.0.0.1`             | IPFS daemon service host                                     |
-| `-p`, `--ipfs-port` | `WAYBACK_IPFS_PORT`               | `5001`                  | IPFS daemon service port                                     |
-| `-m`, `--ipfs-mode` | `WAYBACK_IPFS_MODE`               | `pinner`                | IPFS mode for preserve webpage, e.g. `daemon`, `pinner`      |
-| -                   | `WAYBACK_GITHUB_TOKEN`            | -                       | GitHub Personal Access Token, required the `repo` scope      |
-| -                   | `WAYBACK_GITHUB_OWNER`            | -                       | GitHub account name                                          |
-| -                   | `WAYBACK_GITHUB_REPO`             | -                       | GitHub repository to publish results                         |
-| `-t`, `--token`     | `WAYBACK_TELEGRAM_TOKEN`          | -                       | Telegram Bot API Token                                       |
-| `--chatid`          | `WAYBACK_TELEGRAM_CHANNEL`        | -                       | The Telegram public/private channel id to publish archive result |
-| -                   | `WAYBACK_TELEGRAM_HELPTEXT`       | -                       | The help text for Telegram command                           |
-| -                   | `WAYBACK_MASTODON_SERVER`         | -                       | Domain of Mastodon instance                                  |
-| -                   | `WAYBACK_MASTODON_KEY`            | -                       | The client key of your Mastodon application                  |
-| -                   | `WAYBACK_MASTODON_SECRET`         | -                       | The client secret of your Mastodon application               |
-| -                   | `WAYBACK_MASTODON_TOKEN`          | -                       | The access token of your Mastodon application                |
-| -                   | `WAYBACK_TWITTER_CONSUMER_KEY`    | -                       | The customer key of your Twitter application                 |
-| -                   | `WAYBACK_TWITTER_CONSUMER_SECRET` | -                       | The customer secret of your Twitter application              |
-| -                   | `WAYBACK_TWITTER_ACCESS_TOKEN`    | -                       | The access token of your Twitter application                 |
-| -                   | `WAYBACK_TWITTER_ACCESS_SECRET`   | -                       | The access secret of your Twitter application                |
-| -                   | `WAYBACK_IRC_NICK`                | -                       | IRC nick                                                     |
-| -                   | `WAYBACK_IRC_PASSWORD`            | -                       | IRC password                                                 |
-| -                   | `WAYBACK_IRC_CHANNEL`             | -                       | IRC channel                                                  |
-| -                   | `WAYBACK_IRC_SERVER`              | `irc.libera.chat:6697`  | IRC server, required TLS                                     |
-| -                   | `WAYBACK_MATRIX_HOMESERVER`       | `https://matrix.org`    | Matrix homeserver                                            |
-| -                   | `WAYBACK_MATRIX_USERID`           | -                       | Matrix unique user ID, format: `@foo:example.com`            |
-| -                   | `WAYBACK_MATRIX_ROOMID`           | -                       | Matrix internal room ID, format: `!bar:example.com`          |
-| -                   | `WAYBACK_MATRIX_PASSWORD`         | -                       | Matrix password                                              |
-| -                   | `WAYBACK_DISCORD_BOT_TOKEN`       | -                       | Discord bot authorization token                              |
-| -                   | `WAYBACK_DISCORD_CHANNEL`         | -                       | Discord channel ID, [find channel ID](https://support.discord.com/hc/en-us/articles/206346498-Where-can-I-find-my-server-ID-)  |
-| -                   | `WAYBACK_DISCORD_HELPTEXT`        | -                       | The help text for Discord command                            |
-| -                   | `WAYBACK_SLACK_APP_TOKEN`         | -                       | App-Level Token of Slack app                                 |
-| -                   | `WAYBACK_SLACK_BOT_TOKEN`         | -                       | `Bot User OAuth Token` for Slack workspace, use `User OAuth Token` if requires create external link |
-| -                   | `WAYBACK_SLACK_CHANNEL`           | -                       | Channel ID of Slack channel                                  |
-| -                   | `WAYBACK_SLACK_HELPTEXT`          | -                       | The help text for Slack slash command                        |
-| `--tor`             | `WAYBACK_USE_TOR`                 | `false`                 | Snapshot webpage via Tor anonymity network                   |
-| `--tor-key`         | `WAYBACK_TOR_PRIVKEY`             | -                       | The private key for Tor Hidden Service                       |
-| -                   | `WAYBACK_TOR_LOCAL_PORT`          | `8964`                  | Local port for Tor Hidden Service, also support for a **reverse proxy** |
-| -                   | `WAYBACK_TOR_REMOTE_PORTS`        | `80`                    | Remote ports for Tor Hidden Service, e.g. `WAYBACK_TOR_REMOTE_PORTS=80,81` |
-| -                   | `WAYBACK_TORRC`                   | `/etc/tor/torrc`        | Using `torrc` for Tor Hidden Service                         |
-| -                   | `WAYBACK_SLOT`                    | -                       | Pinning service for IPFS mode of pinner, see [ipfs-pinner](https://github.com/wabarc/ipfs-pinner#supported-pinning-services) |
-| -                   | `WAYBACK_APIKEY`                  | -                       | API key for pinning service                                  |
-| -                   | `WAYBACK_SECRET`                  | -                       | API secret for pinning service                               |
-
-If both of the definition file and environment variables are specified, they are all will be read and apply,
-and preferred from the environment variable for the same item.
-
-Prints the resulting options of the targets with `--print`, in a Go struct with type, without running the `wayback`.
+- [wabarc/on-heroku](https://github.com/wabarc/on-heroku)
+- [wabarc/on-github](https://github.com/wabarc/on-github)
+- [wabarc/on-render](https://github.com/wabarc/on-render)
 
 ### Docker/Podman
 
@@ -274,44 +228,47 @@ docker run -d wabarc/wayback wayback -d telegram -t YOUR-BOT-TOKEN -c YOUR-CHANN
 
 ### 1-Click Deploy
 
+**Note:** These are free hosting options. If you need a quick and simple setup, this method may be ideal.
+
 [![Deploy](https://www.herokucdn.com/deploy/button.png)](https://heroku.com/deploy?template=https://github.com/wabarc/wayback)
+<a href="https://render.com/deploy?repo=https://github.com/wabarc/on-render">
+    <img
+    src="https://render.com/images/deploy-to-render-button.svg"
+    alt="Deploy to Render"
+    width="155px"
+    />
+</a>
 
-## Deployment
+## Screenshots
 
-- [wabarc/on-heroku](https://github.com/wabarc/on-heroku)
-- [wabarc/on-github](https://github.com/wabarc/on-github)
+<details><summary>Click to see screenshots of the services.</summary>
 
-## TODO
+### Discord
+![Discord](./docs/assets/discord-server.png)
 
-[Archive.org](https://web.archive.org/) and [Archive.today](https://archive.today/) are currently supported, the next step mind support the followings platform:
+### Web Service
+![Web](./docs/assets/web.png)
 
-- [x] [IPFS](https://ipfs.io/)
-- [ ] ~~[ZeroNet](https://zeronet.io/)~~
+### Mastodon
+![Mastodon](./docs/assets/mastodon.png)
 
-## Services
+### Matrix
+![Matrix Room](./docs/assets/matrix-room.png)
 
-### Telegram bot
+### IRC
+![IRC](./docs/assets/irc.png)
 
-- [Bots: An introduction for developers](https://core.telegram.org/bots)
-- [How do I create a bot?](https://core.telegram.org/bots#3-how-do-i-create-a-bot)
-- [An example bot](http://t.me/wabarc_bot)
-- [An example channel](http://t.me/wabarc)
+### Slack
+![Slack Channel](./docs/assets/slack-channel.png)
 
-### Mastodon bot
+### Telegram
+![Telegram Bot](./docs/assets/telegram.png)
+![Telegram Channel](./docs/assets/telegram-channel.png)
 
-Bot friendly instance:
+### XMPP
+![XMPP](./docs/assets/xmpp.png)
 
-- [botsin.space](https://botsin.space/about/more)
-
-## F.A.Q
-
-**Q: How to keep the Tor hidden service hostname?**
-
-A: For the first time to run the `wayback` service, keep the key from the output message (the key is the part after `private key:` below)
-and next time to run the `wayback` service to place the key to the `--tor-key` option or the `WAYBACK_TOR_PRIVKEY` environment variable.
-```text
-[INFO] Web: important to keep the private key: d005473a611d2b23e54d6446dfe209cb6c52ddd698818d1233b1d750f790445fcfb5ece556fe5ee3b4724ac6bea7431898ee788c6011febba7f779c85845ae87
-```
+</details>
 
 ## Contributing
 
@@ -324,3 +281,15 @@ Note: All interaction here should conform to the [Code of Conduct](./CODE_OF_CON
 ## License
 
 This software is released under the terms of the GNU General Public License v3.0. See the [LICENSE](https://github.com/wabarc/wayback/blob/main/LICENSE) file for details.
+
+[![FOSSA Status](https://app.fossa.com/api/projects/custom%2B30014%2Fgithub.com%2Fwabarc%2Fwayback.svg?type=large)](https://app.fossa.com/projects/custom%2B30014%2Fgithub.com%2Fwabarc%2Fwayback?ref=badge_large)
+
+## Credits
+
+Thanks to DigitalOcean for supporting open-source software.
+
+<p>
+  <a href="https://m.do.co/c/cb27a8691d73">
+    <img src="https://opensource.nyc3.cdn.digitaloceanspaces.com/attribution/assets/SVG/DO_Logo_horizontal_blue.svg" width="201px" alt="DigitalOcean">
+  </a>
+</p>

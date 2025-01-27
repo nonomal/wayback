@@ -9,7 +9,13 @@ import (
 )
 
 func TestRenderSlack(t *testing.T) {
-	message := `Internet Archive:
+	message := `‹ Example ›
+
+This domain is for use in illustrative examples in documents. You may use this domain in literature without prior coordination or asking for permission.
+
+More information...
+
+Internet Archive:
 • https://web.archive.org/web/20211000000001/https://example.com/
 
 archive.today:
@@ -22,9 +28,9 @@ Telegraph:
 • http://telegra.ph/title-01-01
 
 
-<https://anonfiles.com/|AnonFiles> - [ <|IMG> ¦ <|PDF> ¦ <|RAW> ¦ <|TXT> ¦ <|HAR> ¦ <|WARC> ¦ <|MEDIA> ]
-<https://catbox.moe/|Catbox> - [ <|IMG> ¦ <|PDF> ¦ <|RAW> ¦ <|TXT> ¦ <|HAR> ¦ <|WARC> ¦ <|MEDIA> ]`
-	got := ForPublish(&Slack{Cols: collects}).String()
+<https://catbox.moe/|Catbox> - [ <https://files.catbox.moe/9u6yvu.png|IMG> ¦ <https://files.catbox.moe/q73uqh.pdf|PDF> ¦ <https://files.catbox.moe/bph1g6.htm|RAW> ¦ <https://files.catbox.moe/wwrby6.txt|TXT> ¦ <https://files.catbox.moe/3agtva.har|HAR> ¦ <|HTM> ¦ <|WARC> ¦ <|MEDIA> ]`
+
+	got := ForPublish(&Slack{Cols: collects, Data: bundleExample}).String()
 	if got != message {
 		t.Errorf("Unexpected render template for Slack got \n%s\ninstead of \n%s", got, message)
 	}
@@ -41,12 +47,9 @@ IPFS:
 • Archive failed.
 
 Telegraph:
-• https://web.archive.org/*/https://webcache.googleusercontent.com/search?q=cache:https://example.com/404
+• https://web.archive.org/*/https://webcache.googleusercontent.com/search?q=cache:https://example.com/`
 
-
-<https://anonfiles.com/|AnonFiles> - [ <|IMG> ¦ <|PDF> ¦ <|RAW> ¦ <|TXT> ¦ <|HAR> ¦ <|WARC> ¦ <|MEDIA> ]
-<https://catbox.moe/|Catbox> - [ <|IMG> ¦ <|PDF> ¦ <|RAW> ¦ <|TXT> ¦ <|HAR> ¦ <|WARC> ¦ <|MEDIA> ]`
-	got := ForPublish(&Slack{Cols: flawed}).String()
+	got := ForPublish(&Slack{Cols: flawed, Data: emptyBundle}).String()
 	if got != message {
 		t.Errorf("Unexpected render template for Slack, got \n%s\ninstead of \n%s", got, message)
 	}
@@ -63,8 +66,12 @@ Internet Archive:
 • https://web.archive.org/123/https://example.org/
 
 archive.today:
-• http://archive.today/abc`
-	got := ForReply(&Slack{Cols: multi}).String()
+• http://archive.today/abc
+
+
+<https://catbox.moe/|Catbox> - [ <https://files.catbox.moe/9u6yvu.png|IMG> ¦ <https://files.catbox.moe/q73uqh.pdf|PDF> ¦ <https://files.catbox.moe/bph1g6.htm|RAW> ¦ <https://files.catbox.moe/wwrby6.txt|TXT> ¦ <https://files.catbox.moe/3agtva.har|HAR> ¦ <|HTM> ¦ <|WARC> ¦ <|MEDIA> ]`
+
+	got := ForReply(&Slack{Cols: multi, Data: bundleExample}).String()
 	if got != message {
 		t.Errorf("Unexpected render template for Slack, got \n%s\ninstead of \n%s", got, message)
 	}

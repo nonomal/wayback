@@ -9,6 +9,9 @@ PACKDIR ?= ./build/package
 LDFLAGS := $(shell echo "-X '${REPO}/version.Version=`git describe --tags --abbrev=0`'")
 LDFLAGS := $(shell echo "${LDFLAGS} -X '${REPO}/version.Commit=`git rev-parse --short HEAD`'")
 LDFLAGS := $(shell echo "${LDFLAGS} -X '${REPO}/version.BuildDate=`date +%FT%T%z`'")
+LDFLAGS := $(shell echo "${LDFLAGS} -X '${REPO}/config.IPFSTarget=$(shell echo ${WAYBACK_IPFS_TARGET})'")
+LDFLAGS := $(shell echo "${LDFLAGS} -X '${REPO}/config.IPFSApikey=$(shell echo ${WAYBACK_IPFS_APIKEY})'")
+LDFLAGS := $(shell echo "${LDFLAGS} -X '${REPO}/config.IPFSSecret=$(shell echo ${WAYBACK_IPFS_SECRET})'")
 GOBUILD ?= go build -trimpath --ldflags "-s -w ${LDFLAGS} -buildid=" -v
 VERSION ?= $(shell git describe --tags `git rev-list --tags --max-count=1` | sed -e 's/v//g')
 GOFILES ?= $(wildcard ./cmd/wayback/*.go)
@@ -22,7 +25,7 @@ DEB_IMG_ARCH := amd64
 
 .PHONY: help
 help: ## show help message
-	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make <taraget>\n\nTargets: \033[36m\033[0m\n"} /^[$$()% 0-9a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make <target>\n\nTargets: \033[36m\033[0m\n"} /^[$$()% 0-9a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
 PLATFORM_LIST = \
 	darwin-amd64 \
@@ -124,6 +127,7 @@ fmt: ## Format codebase
 vet: ## Vet codebase
 	@echo "-> Running go vet"
 	@go vet $(PACKAGES)
+	@go vet -tags with_lux $(PACKAGES)
 
 test: ## Run testing
 	@echo "-> Running go test"
@@ -132,8 +136,7 @@ test: ## Run testing
 
 test-integration: ## Run integration testing
 	@echo 'mode: atomic' > coverage.out
-	@go list ./... | xargs -n1 -I{} sh -c 'CGO_ENABLED=1 go test -race -tags=integration -covermode=atomic -coverprofile=coverage.tmp -coverpkg $(go list ./... | tr "\n" ",") {} && tail -n +2 coverage.tmp >> coverage.out || exit 255'
-	@rm coverage.tmp
+	@CGO_ENABLED=1 go test -race -tags=integration -covermode=atomic -parallel=1 -coverprofile=coverage.out ./...
 
 test-cover: ## Collect code coverage
 	@echo "-> Running go tool cover"
@@ -142,47 +145,65 @@ test-cover: ## Collect code coverage
 
 bench: ## Benchmark test
 	@echo "-> Running benchmark"
-	@go test -v -bench .
+	@go test -v -bench ./...
 
 profile: ## Test and profile
 	@echo "-> Running profile"
-	@go test -cpuprofile cpu.prof -memprofile mem.prof -v -bench .
+	@go test -cpuprofile cpu.prof -memprofile mem.prof -v -bench ./...
 
 docker-image: ## Build Docker image
 	@echo "-> Building docker image..."
-	@$(DOCKER) build -t $(DOCKER_IMAGE):$(VERSION) -f ./build/docker/Dockerfile.dev .
+	@$(DOCKER) build \
+		--build-arg WAYBACK_IPFS_TARGET=$(shell echo ${WAYBACK_IPFS_TARGET}) \
+		--build-arg WAYBACK_IPFS_APIKEY=$(shell echo ${WAYBACK_IPFS_APIKEY}) \
+		--build-arg WAYBACK_IPFS_SECRET=$(shell echo ${WAYBACK_IPFS_SECRET}) \
+		-t $(DOCKER_IMAGE):$(VERSION) \
+		-f ./build/docker/Dockerfile.dev .
 
 rpm: ## Build RPM package
 	@echo "-> Building rpm package..."
 	@$(DOCKER) build \
+		--build-arg WAYBACK_IPFS_TARGET=$(shell echo ${WAYBACK_IPFS_TARGET}) \
+		--build-arg WAYBACK_IPFS_APIKEY=$(shell echo ${WAYBACK_IPFS_APIKEY}) \
+		--build-arg WAYBACK_IPFS_SECRET=$(shell echo ${WAYBACK_IPFS_SECRET}) \
 		-t wayback-rpm-builder \
 		-f build/redhat/Dockerfile .
 	@$(DOCKER) run --rm \
-		-v ${PWD}/build/package:/root/rpmbuild/RPMS/x86_64 wayback-rpm-builder \
-		rpmbuild -bb --define "_wayback_version $(VERSION)" /root/rpmbuild/SPECS/wayback.spec
+		-e WAYBACK_SIGNING_KEY="$${WAYBACK_SIGNING_KEY}" \
+		-e WAYBACK_SIGNING_PASSPHARSE="$${WAYBACK_SIGNING_PASSPHARSE}" \
+		-e VERSION="${VERSION}" \
+		-v ${PWD}/build/package:/rpmbuild/RPMS/x86_64:Z \
+		wayback-rpm-builder
 
 debian: ## Build Debian packages
 	@echo "-> Building deb package..."
-	@$(DOCKER) build \
-		--build-arg IMAGE_ARCH=$(DEB_IMG_ARCH) \
+	@$(DOCKER) buildx build --load \
+		--platform linux/$(DOCKER_PLATFORM) \
 		--build-arg PKG_VERSION=$(VERSION) \
-		--build-arg PKG_ARCH=$(PKG_ARCH) \
-		-t $(DEB_IMG_ARCH)/wayback-deb-builder \
-		-f build/debian/Dockerfile .
-	@$(DOCKER) run --rm \
-		-v ${PWD}/build/package:/pkg \
-		$(DEB_IMG_ARCH)/wayback-deb-builder
+		--build-arg WAYBACK_IPFS_TARGET=$(shell echo ${WAYBACK_IPFS_TARGET}) \
+		--build-arg WAYBACK_IPFS_APIKEY=$(shell echo ${WAYBACK_IPFS_APIKEY}) \
+		--build-arg WAYBACK_IPFS_SECRET=$(shell echo ${WAYBACK_IPFS_SECRET}) \
+		-t wayback-deb-builder \
+		-f build/debian/Dockerfile \
+		.
+	@$(DOCKER) run --rm --platform linux/$(DOCKER_PLATFORM) \
+		-v ${PWD}/build/package:/pkg wayback-deb-builder
 	@echo "-> DEB package below:"
 	@ls -h ${PWD}/build/package/*.deb
 
 debian-packages: ## Build Debian packages, including amd64, arm32v7, arm64v8
-	$(MAKE) debian DEB_IMG_ARCH=amd64
-	$(MAKE) debian DEB_IMG_ARCH=arm32v7 PKG_ARCH=armv7
-	$(MAKE) debian DEB_IMG_ARCH=arm64v8 PKG_ARCH=arm64
+	$(MAKE) debian DOCKER_PLATFORM=amd64
+	$(MAKE) debian DOCKER_PLATFORM=arm64
+	$(MAKE) debian DOCKER_PLATFORM=arm/v7
 
 submodule: ## Update Git submodule
 	@echo "-> Updating Git submodule..."
 	@git submodule update --init --recursive --remote
+
+bina: ## Update bina.json
+	@echo "-> Updating bina.json"
+	$(eval LATEST_TAG := $(shell git describe --tags --abbrev=0 | sed 's/v//'))
+	sed "s#0.0.0#${LATEST_TAG}#g" bina.tpl.json > bina.json
 
 scan: ## Scan vulnerabilities
 	@echo "-> Scanning vulnerabilities..."

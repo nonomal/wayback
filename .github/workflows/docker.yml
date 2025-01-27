@@ -1,37 +1,84 @@
+# Copyright 2020 Wayback Archiver. All rights reserved.
+# Use of this source code is governed by the GNU GPL v3
+# license that can be found in the LICENSE file.
+#
 name: Docker
 
 on:
-  schedule:
-    - cron: '0 0 * * *'
   push:
     tags:
-      - 'v*'
+      - "v*"
     branches:
       - 'main'
       - 'develop'
     paths-ignore:
-      - '**.md'
+      - "**.md"
       - 'snapcraft.yaml'
+      - 'requirements.txt'
+      - '.github/**'
+      - '!.github/workflows/docker.yml'
+      - 'docs/**'
+      - 'mkdocs.yml'
   pull_request:
     branches:
       - 'main'
     paths-ignore:
-      - '**.md'
+      - "**.md"
       - 'snapcraft.yaml'
+      - 'requirements.txt'
+      - '.github/**'
+      - '!.github/workflows/docker.yml'
+      - 'docs/**'
+      - 'mkdocs.yml'
   workflow_dispatch:
 
-permissions: write-all
+permissions:
+  contents: read
+
+# New runs to only cancel in-progress runs of the same workflow.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   publish:
-    if: github.repository == 'wabarc/wayback'
     name: Build and push Docker image
     runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      id-token: write
+    outputs:
+      image: ${{ steps.prep.outputs.ghcr }}
+      version: ${{ steps.meta.outputs.version }}
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@2e205a28d0e1da00c5f53b161f4067b052c61f34 # v1.5.0
+        with:
+          egress-policy: audit
+          disable-telemetry: true
+          allowed-endpoints: >
+            ghcr.io:443
+            github.com:443
+            api.github.com:443
+            *.githubusercontent.com
+            docker.io:443
+            auth.docker.io:443
+            index.docker.io:443
+            registry-1.docker.io:443
+            production.cloudflare.docker.com:443
+            dl-cdn.alpinelinux.org:443
+            storage.googleapis.com:443
+            proxy.golang.org:443
+            sum.golang.org:443
+
       - name: Checkout default branch
-        uses: actions/checkout@v2
+        uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c # v3.3.0
         with:
           fetch-depth: 0
+
+      - name: Install Cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@e1523de7571e31dbe865fd2e80c5c7c23ae71eb4 # v3.4.0
 
       - name: Prepare
         id: prep
@@ -48,28 +95,28 @@ jobs:
             DOCKER_IMAGE_VERSION=edge
           fi
           TAGS="${TAGS},${DOCKER_HOST}/${DOCKER_IMAGE_SCOPE}:${DOCKER_IMAGE_VERSION},${GHCR_HOST}/${DOCKER_IMAGE_SCOPE}:${DOCKER_IMAGE_VERSION}"
-          echo ::set-output name=tags::${TAGS}
-          echo ::set-output name=version::${DOCKER_IMAGE_VERSION}
-          echo ::set-output name=docker::${DOCKER_HOST}/${DOCKER_IMAGE_SCOPE}
-          echo ::set-output name=ghcr::${GHCR_HOST}/${DOCKER_IMAGE_SCOPE}
-          echo ::set-output name=images::${DOCKER_HOST}/${DOCKER_IMAGE_SCOPE},${GHCR_HOST}/${DOCKER_IMAGE_SCOPE}
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+          echo "version=${DOCKER_IMAGE_VERSION}" >> $GITHUB_OUTPUT
+          echo "docker=${DOCKER_HOST}/${DOCKER_IMAGE_SCOPE}" >> $GITHUB_OUTPUT
+          echo "ghcr=${GHCR_HOST}/${DOCKER_IMAGE_SCOPE}" >> $GITHUB_OUTPUT
+          echo "images=${DOCKER_HOST}/${DOCKER_IMAGE_SCOPE},${GHCR_HOST}/${DOCKER_IMAGE_SCOPE}" >> $GITHUB_OUTPUT
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
+        uses: docker/setup-qemu-action@e81a89b1732b9c48d79cd809d8d81d79c4647a18 # v2.1.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@f03ac48505955848960e80bbb68046aa35c7b9e7 # v2.4.1
 
       - name: Login to Docker Hub
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v1
+        uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a # v2.1.0
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
+          username: ${{ vars.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Login to GitHub Container Registry
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v1
+        uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a # v2.1.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -77,7 +124,7 @@ jobs:
 
       - name: Generate meta
         id: meta
-        uses: docker/metadata-action@v3
+        uses: docker/metadata-action@507c2f2dc502c992ad446e3d7a5dfbe311567a96 # v4.3.0
         with:
           images: ${{ steps.prep.outputs.images }}
           tags: |
@@ -85,16 +132,24 @@ jobs:
             type=raw,${{ steps.prep.outputs.version }}
 
       - name: Build artifacts
-        uses: docker/bake-action@v1
+        uses: docker/bake-action@3fc70e1131fee40a422dd8dd0ff22014ae20a1f3 # v5.11.0
+        env:
+          WAYBACK_IPFS_TARGET: ${{ secrets.WAYBACK_IPFS_TARGET }}
+          WAYBACK_IPFS_APIKEY: ${{ secrets.WAYBACK_IPFS_APIKEY }}
+          WAYBACK_IPFS_SECRET: ${{ secrets.WAYBACK_IPFS_SECRET }}
         with:
           files: ./docker-bake.hcl
           targets: artifact-all
           set: |
-            *.cache-from=type=local,src=/tmp/.image-cache/artifacts
-            *.cache-to=type=local,dest=/tmp/.image-cache-new/artifacts
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
 
       - name: Build and push Docker image
-        uses: docker/bake-action@v1
+        uses: docker/bake-action@6c87dcca988e4e074e3ab1f976a70f63ec9673fb # v2.3.0
+        env:
+          WAYBACK_IPFS_TARGET: ${{ secrets.WAYBACK_IPFS_TARGET }}
+          WAYBACK_IPFS_APIKEY: ${{ secrets.WAYBACK_IPFS_APIKEY }}
+          WAYBACK_IPFS_SECRET: ${{ secrets.WAYBACK_IPFS_SECRET }}
         with:
           files: |
             ./docker-bake.hcl
@@ -102,8 +157,17 @@ jobs:
           targets: release
           push: ${{ github.event_name != 'pull_request' }}
           set: |
-            *.cache-from=type=local,src=/tmp/.image-cache/image
-            *.cache-to=type=local,dest=/tmp/.image-cache-new/image
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
+
+      - name: Siging image
+        if: github.event_name != 'pull_request'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          COSIGN_PRIVATE_KEY: ${{secrets.COSIGN_PRIVATE_KEY}}
+          COSIGN_PASSWORD: ${{secrets.COSIGN_PASSPHARSE}}
+        run: |
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY ${TAGS}
 
       - name: Check manifest
         if: github.event_name != 'pull_request'
@@ -119,22 +183,50 @@ jobs:
           docker pull ${{ steps.prep.outputs.ghcr }}:${{ steps.meta.outputs.version }}
           docker image inspect ${{ steps.prep.outputs.ghcr }}:${{ steps.meta.outputs.version }}
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v2
-        with:
-          name: wayback
-          path: ./dist/*
-          if-no-files-found: error
+      - name: Cosign verify
+        if: github.event_name != 'pull_request'
+        run: |
+          IMAGE_NAME=${{ steps.prep.outputs.ghcr }}:${{ steps.meta.outputs.version }}
+          cat cosign.pub
+          cosign verify --key cosign.pub $IMAGE_NAME
 
   allinone:
-    if: github.repository == 'wabarc/wayback'
     name: AllInOne Docker image
     runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      id-token: write
+    outputs:
+      image: ${{ steps.prep.outputs.ghcr }}
+      version: ${{ steps.meta.outputs.version }}
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@2e205a28d0e1da00c5f53b161f4067b052c61f34 # v1.5.0
+        with:
+          egress-policy: audit
+          disable-telemetry: true
+          allowed-endpoints: >
+            ghcr.io:443
+            github.com:443
+            api.github.com:443
+            docker.io:443
+            *.githubusercontent.com
+            auth.docker.io:443
+            registry-1.docker.io:443
+            production.cloudflare.docker.com:443
+            dl-cdn.alpinelinux.org:443
+            storage.googleapis.com:443
+            proxy.golang.org:443
+            sum.golang.org:443
+
       - name: Checkout default branch
-        uses: actions/checkout@v2
+        uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c # v3.3.0
         with:
           fetch-depth: 0
+
+      - name: Install Cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@e1523de7571e31dbe865fd2e80c5c7c23ae71eb4 # v3.4.0
 
       - name: Prepare
         id: prep
@@ -150,20 +242,20 @@ jobs:
             DOCKER_IMAGE_VERSION=edge
           fi
           TAGS="${TAGS},${GHCR_HOST}/${DOCKER_IMAGE_SCOPE}:${DOCKER_IMAGE_VERSION}"
-          echo ::set-output name=tags::${TAGS}
-          echo ::set-output name=version::${DOCKER_IMAGE_VERSION}
-          echo ::set-output name=ghcr::${GHCR_HOST}/${DOCKER_IMAGE_SCOPE}
-          echo ::set-output name=images::${GHCR_HOST}/${DOCKER_IMAGE_SCOPE}
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+          echo "version=${DOCKER_IMAGE_VERSION}" >> $GITHUB_OUTPUT
+          echo "ghcr=${GHCR_HOST}/${DOCKER_IMAGE_SCOPE}" >> $GITHUB_OUTPUT
+          echo "images=${GHCR_HOST}/${DOCKER_IMAGE_SCOPE}" >> $GITHUB_OUTPUT
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
+        uses: docker/setup-qemu-action@e81a89b1732b9c48d79cd809d8d81d79c4647a18 # v2.1.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@f03ac48505955848960e80bbb68046aa35c7b9e7 # v2.4.1
 
       - name: Login to GitHub Container Registry
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v1
+        uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a # v2.1.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -171,7 +263,7 @@ jobs:
 
       - name: Generate meta
         id: meta
-        uses: docker/metadata-action@v3
+        uses: docker/metadata-action@507c2f2dc502c992ad446e3d7a5dfbe311567a96 # v4.3.0
         with:
           images: ${{ steps.prep.outputs.images }}
           flavor: |
@@ -181,16 +273,24 @@ jobs:
             type=raw,${{ steps.prep.outputs.version }}
 
       - name: Build artifacts
-        uses: docker/bake-action@v1
+        uses: docker/bake-action@3fc70e1131fee40a422dd8dd0ff22014ae20a1f3 # v5.11.0
+        env:
+          WAYBACK_IPFS_TARGET: ${{ secrets.WAYBACK_IPFS_TARGET }}
+          WAYBACK_IPFS_APIKEY: ${{ secrets.WAYBACK_IPFS_APIKEY }}
+          WAYBACK_IPFS_SECRET: ${{ secrets.WAYBACK_IPFS_SECRET }}
         with:
           files: ./docker-bake.hcl
           targets: artifact-all
           set: |
-            *.cache-from=type=local,src=/tmp/.image-cache/artifacts
-            *.cache-to=type=local,dest=/tmp/.image-cache-new/artifacts
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
 
       - name: Build and push Docker image
-        uses: docker/bake-action@v1
+        uses: docker/bake-action@6c87dcca988e4e074e3ab1f976a70f63ec9673fb # v2.3.0
+        env:
+          WAYBACK_IPFS_TARGET: ${{ secrets.WAYBACK_IPFS_TARGET }}
+          WAYBACK_IPFS_APIKEY: ${{ secrets.WAYBACK_IPFS_APIKEY }}
+          WAYBACK_IPFS_SECRET: ${{ secrets.WAYBACK_IPFS_SECRET }}
         with:
           files: |
             ./docker-bake.hcl
@@ -198,8 +298,17 @@ jobs:
           targets: bundle
           push: ${{ github.event_name != 'pull_request' }}
           set: |
-            *.cache-from=type=local,src=/tmp/.image-cache/image
-            *.cache-to=type=local,dest=/tmp/.image-cache-new/image
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
+
+      - name: Sign image with a key
+        if: github.event_name != 'pull_request'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          COSIGN_PRIVATE_KEY: ${{secrets.COSIGN_PRIVATE_KEY}}
+          COSIGN_PASSWORD: ${{secrets.COSIGN_PASSPHARSE}}
+        run: |
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY ${TAGS}
 
       - name: Check manifest
         if: github.event_name != 'pull_request'
@@ -212,26 +321,37 @@ jobs:
           docker pull ${{ steps.prep.outputs.ghcr }}:${{ steps.meta.outputs.version }}
           docker image inspect ${{ steps.prep.outputs.ghcr }}:${{ steps.meta.outputs.version }}
 
-  dispatch:
-    if: github.repository == 'wabarc/wayback'
-    name: Repository Dispatch
-    runs-on: ubuntu-latest
-    needs: [publish]
-    steps:
-    - name: Dispatch repository in wabarc/on-heroku (release)
-      uses: peter-evans/repository-dispatch@v1
-      if: startsWith(github.ref, 'refs/tags/v')
-      with:
-        repository: wabarc/on-heroku
-        event-type: deploy
-        token: ${{ secrets.PAT_WORKFLOW }}
-        client-payload: '{"from": "${{ github.repository }}", "channel": "stable"}'
+      - name: Cosign verify
+        if: github.event_name != 'pull_request'
+        run: |
+          IMAGE_NAME=${{ steps.prep.outputs.ghcr }}:${{ steps.meta.outputs.version }}
+          cat cosign.pub
+          cosign verify --key cosign.pub $IMAGE_NAME
 
-    - name: Dispatch repository in wabarc/on-heroku (testing)
-      uses: peter-evans/repository-dispatch@v1
-      if: ${{ github.event_name == 'push' }}
-      with:
-        repository: wabarc/on-heroku
-        event-type: deploy
-        token: ${{ secrets.PAT_WORKFLOW }}
-        client-payload: '{"from": "${{ github.repository }}", "channel": "edge"}'
+  trivy-standalone:
+    name: Trivy for standalone
+    uses: wabarc/.github/.github/workflows/reusable-trivy.yml@main
+    needs: publish
+    permissions:
+      contents: read # for actions/checkout to fetch code
+      security-events: write # for github/codeql-action/upload-sarif to upload SARIF results
+      actions: read # only required for a private repository by github/codeql-action/upload-sarif to get the Action run status
+    with:
+      scan-type: 'image'
+      image-ref: '${{ needs.publish.outputs.image }}:${{ needs.publish.outputs.version }}'
+      sarif: 'container-standalone.sarif'
+      egress-policy: 'audit'
+
+  trivy-bundle:
+    name: Trivy for bundle
+    uses: wabarc/.github/.github/workflows/reusable-trivy.yml@main
+    needs: allinone
+    permissions:
+      contents: read # for actions/checkout to fetch code
+      security-events: write # for github/codeql-action/upload-sarif to upload SARIF results
+      actions: read # only required for a private repository by github/codeql-action/upload-sarif to get the Action run status
+    with:
+      scan-type: 'image'
+      image-ref: '${{ needs.allinone.outputs.image }}:${{ needs.allinone.outputs.version }}'
+      sarif: 'container-bundle.sarif'
+      egress-policy: 'audit'

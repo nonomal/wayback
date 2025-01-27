@@ -1,12 +1,20 @@
 # syntax=docker/dockerfile:1.2
-ARG GO_VERSION=1.17
+ARG GO_VERSION=1.22
 
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS builder
 
 RUN apk add --no-cache -U build-base ca-certificates linux-headers musl-dev git tar
 
 ARG TARGETPLATFORM
+ARG WAYBACK_IPFS_TARGET
+ARG WAYBACK_IPFS_APIKEY
+ARG WAYBACK_IPFS_SECRET
+
 WORKDIR /src
+
+ENV WAYBACK_IPFS_TARGET ${WAYBACK_IPFS_TARGET}
+ENV WAYBACK_IPFS_APIKEY ${WAYBACK_IPFS_APIKEY}
+ENV WAYBACK_IPFS_SECRET ${WAYBACK_IPFS_SECRET}
 
 COPY . .
 RUN set -eu && \
@@ -15,10 +23,15 @@ RUN set -eu && \
     && mv ./build/binary/wayback-* /wayback
 
 # Application layer
-FROM alpine:3.13
+FROM alpine:3.17
 
 LABEL org.wabarc.homepage="http://github.com/wabarc" \
-      org.wabarc.repository="http://github.com/wabarc/wayback"
+      org.wabarc.repository="http://github.com/wabarc/wayback" \
+      org.opencontainers.image.title=wayback \
+      org.opencontainers.image.description="A toolkit for snapshot webpage to Internet Archive, archive.today, IPFS and beyond" \
+      org.opencontainers.image.url=https://wabarc.eu.org \
+      org.opencontainers.image.licenses=GPLv3 \
+      org.opencontainers.image.source="https://github.com/wabarc/wayback"
 
 ARG TOR_EXCLUDE_NODE="{cn},{hk},{mo},{sg},{th},{pk},{by},{ru},{ir},{sy},{vn},{ph},{my},{cu}"
 ARG TOR_EXCLUDE_EXIT_NODE="{cn},{hk},{mo},{sg},{kp},{th},{pk},{by},{ru},{ir},{sy},{vn},{ph},{my},{cu},{au},{ca},{nz},{gb},{us},{fr},{dk},{nl},{no},{be},{de},{it},{es}"
@@ -29,6 +42,7 @@ ENV PGROUP wayback
 ENV LANG en_US.UTF-8
 ENV LC_ALL en_US.UTF-8
 ENV LANGUAGE en_US.UTF-8
+ENV DISPLAY=:99.0
 
 WORKDIR $BASE_DIR
 
@@ -57,9 +71,9 @@ RUN set -o pipefail; \
 
 EXPOSE 8964
 
+# Ref: https://wiki.alpinelinux.org/wiki/Fonts
 # Trigger on downstream build, only support for docker,
 # add flag `--format=docker` if using podman.
-# Ref: https://wiki.alpinelinux.org/wiki/Fonts
 ONBUILD RUN set -o pipefail; \
     apk add --no-cache -U \
     chromium \

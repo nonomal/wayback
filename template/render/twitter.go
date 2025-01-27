@@ -6,12 +6,11 @@ package render // import "github.com/wabarc/wayback/template/render"
 
 import (
 	"bytes"
-	"sort"
-	"strings"
 	"text/template"
 
 	"github.com/wabarc/logger"
 	"github.com/wabarc/wayback"
+	"github.com/wabarc/wayback/reduxer"
 )
 
 var _ Renderer = (*Twitter)(nil)
@@ -19,7 +18,7 @@ var _ Renderer = (*Twitter)(nil)
 // Twitter represents a Twitter template data for render.
 type Twitter struct {
 	Cols []wayback.Collect
-	Data interface{}
+	Data reduxer.Reduxer
 }
 
 // ForReply implements the standard Renderer interface:
@@ -27,12 +26,12 @@ type Twitter struct {
 func (t *Twitter) ForReply() *Render {
 	var tmplBytes bytes.Buffer
 
-	const tmpl = `{{range $ := .}}{{ if not $.Arc "ph" }}{{ $.Arc | name }}:
+	const tmpl = `{{range $ := .}}{{ if not $.Arc "ph" }}
+• {{ $.Arc | name }}
 {{ range $map := $.Dst -}}
 {{ range $src, $dst := $map -}}
-• {{ $dst }}
-{{end}}{{end}}
-{{end}}{{end}}`
+> {{ $dst }}
+{{end}}{{end}}{{end}}{{end}}`
 
 	tpl, err := template.New("twitter").Funcs(funcMap()).Parse(tmpl)
 	if err != nil {
@@ -41,7 +40,7 @@ func (t *Twitter) ForReply() *Render {
 	}
 
 	groups := groupBySlot(t.Cols)
-	logger.Debug("for reply telegram: %#v", groups)
+	logger.Debug("for reply twitter: %#v", groups)
 
 	tmplBytes.WriteString(original(groups))
 	if err := tpl.Execute(&tmplBytes, groups); err != nil {
@@ -55,7 +54,7 @@ func (t *Twitter) ForReply() *Render {
 }
 
 // ForPublish implements the standard Renderer interface:
-// it reads `[]wayback.Collect` and `reduxer.Bundle` from
+// it reads `[]wayback.Collect` and `reduxer.Reduxer` from
 // the Twitter and returns a *Render.
 //
 // ForPublish generate tweet of given wayback collects in Twitter struct.
@@ -63,16 +62,16 @@ func (t *Twitter) ForReply() *Render {
 func (t *Twitter) ForPublish() *Render {
 	var tmplBytes bytes.Buffer
 
-	if head := Title(bundle(t.Data)); head != "" {
+	if title := Title(t.Cols, t.Data); title != "" {
 		tmplBytes.WriteString(`‹ `)
-		tmplBytes.WriteString(head)
+		tmplBytes.WriteString(title)
 		tmplBytes.WriteString(" ›\n\n")
 	}
 
-	const tmpl = `{{range $ := .}}{{ if not $.Arc "ph" }}{{ $.Arc | name }}:
-• {{ $.Dst }}
-{{end}}
-{{end}}`
+	const tmpl = `{{range $ := .}}{{ if not $.Arc "ph" }}
+• {{ $.Arc | name }}
+> {{ $.Dst }}
+{{end}}{{end}}`
 
 	tpl, err := template.New("twitter").Funcs(funcMap()).Parse(tmpl)
 	if err != nil {
@@ -89,51 +88,4 @@ func (t *Twitter) ForPublish() *Render {
 	tmplBytes.WriteString("\n\n#wayback #存档")
 
 	return &Render{buf: tmplBytes}
-}
-
-func original(v interface{}) (o string) {
-	var sm = make(map[string]int)
-	if vv, ok := v.([]wayback.Collect); ok && len(vv) > 0 {
-		for _, col := range vv {
-			sm[col.Src] += 1
-		}
-	} else if vv, ok := v.(*Collects); ok {
-		for _, cols := range *vv {
-			for _, dst := range cols.Dst {
-				for src := range dst {
-					sm[src] += 1
-				}
-			}
-		}
-	} else {
-		return o
-	}
-
-	if len(sm) == 0 {
-		return o
-	}
-
-	type kv struct {
-		Key   string
-		Value int
-	}
-
-	var ss []kv
-	for k, v := range sm {
-		ss = append(ss, kv{k, v})
-	}
-	sort.Slice(ss, func(i, j int) bool {
-		return ss[i].Value > ss[j].Value
-	})
-
-	var sb strings.Builder
-	sb.WriteString("source:\n")
-	for _, kv := range ss {
-		sb.WriteString(`• `)
-		sb.WriteString(kv.Key)
-		sb.WriteString("\n")
-	}
-	sb.WriteString("\n————\n\n")
-
-	return sb.String()
 }

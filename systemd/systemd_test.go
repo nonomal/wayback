@@ -2,22 +2,20 @@
 // Use of this source code is governed by the GNU GPL v3
 // license that can be found in the LICENSE file.
 
+//go:build !windows
+// +build !windows
+
 package systemd // import "github.com/wabarc/wayback/systemd"
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"testing"
 )
 
 func TestSdNotify(t *testing.T) {
-	testDir, err := ioutil.TempDir("", "test-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(testDir)
+	testDir := t.TempDir()
 
 	notifySocket := testDir + "/notify-socket.sock"
 	laddr := net.UnixAddr{

@@ -24,15 +24,20 @@ const (
 	ServiceMastodon = "mastodon"
 	ServiceTelegram = "telegram"
 	ServiceTwitter  = "twitter"
+	ServiceXMPP     = "xmpp"
 
-	PublishIRC     = "irc"      // IRC channel
-	PublishChannel = "channel"  // Telegram channel
-	PublishMstdn   = "mastodon" // Mastodon toot
-	PublishGithub  = "github"   // GitHub issues
-	PublishMatrix  = "room"
-	PublishSlack   = "slack"
-	PublishDiscord = "discord" // Discord channel
-	PublishTwitter = "tweet"
+	PublishIRC      = "irc"      // IRC channel
+	PublishGithub   = "github"   // GitHub issues
+	PublishNotion   = "notion"   // Notion page
+	PublishChannel  = "telegram" // Telegram channel
+	PublishMstdn    = "mastodon" // Mastodon toot
+	PublishDiscord  = "discord"  // Discord channel
+	PublishTwitter  = "twitter"
+	PublishMatrix   = "matrix"
+	PublishSlack    = "slack"
+	PublishNostr    = "nostr"
+	PublishMeili    = "meili"
+	PublishOmnivore = "omnivore"
 
 	StatusRequest = "request"
 	StatusSuccess = "success"

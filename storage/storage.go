@@ -14,6 +14,8 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+var ErrDatabaseNotFound = errors.New("database not found")
+
 // Storage handles all operations related to the database.
 type Storage struct {
 	db *bolt.DB
@@ -21,9 +23,9 @@ type Storage struct {
 
 // Open a bolt database on current directory in given path.
 // It is the caller's responsibility to close it.
-func Open(path string) (*Storage, error) {
+func Open(opts *config.Options, path string) (*Storage, error) {
 	if path == "" {
-		path = config.Opts.BoltPathname()
+		path = opts.BoltPathname()
 	}
 	db, err := bolt.Open(path, 0600, nil)
 	if err != nil {
@@ -38,11 +40,11 @@ func (s *Storage) Close() error {
 	if s.db != nil {
 		return s.db.Close()
 	}
-	return errors.New("database not found.")
+	return ErrDatabaseNotFound
 }
 
-func itob(v int) []byte {
+func itob(v uint64) []byte {
 	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, uint64(v))
+	binary.BigEndian.PutUint64(b, v)
 	return b
 }

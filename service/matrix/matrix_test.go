@@ -17,10 +17,13 @@ import (
 	"github.com/wabarc/helper"
 	"github.com/wabarc/wayback/config"
 	"github.com/wabarc/wayback/pooling"
+	"github.com/wabarc/wayback/publish"
+	"github.com/wabarc/wayback/service"
 	"github.com/wabarc/wayback/storage"
-	matrix "maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
+
+	matrix "maunium.net/go/mautrix"
 )
 
 // testServer returns an http Client, ServeMux, and Server. The client proxies
@@ -66,6 +69,31 @@ func (m *Matrix) setup(roomIDs []id.RoomID) {
 	}
 }
 
+func (m *Matrix) joinedRooms() []id.RoomID {
+	var rooms []id.RoomID
+	if m.client == nil {
+		return rooms
+	}
+	resp, err := m.client.JoinedRooms()
+	if err != nil {
+		return rooms
+	}
+
+	return resp.JoinedRooms
+}
+
+func (m *Matrix) destroyRoom(roomID id.RoomID) {
+	if roomID == "" || m.client == nil {
+		return
+	}
+	if id.RoomID(m.opts.MatrixRoomID()) == roomID {
+		return
+	}
+
+	m.client.LeaveRoom(roomID)
+	m.client.ForgetRoom(roomID)
+}
+
 var (
 	homeserver = "https://matrix.org"
 	senderUID  = os.Getenv("SENDER_UID")
@@ -88,26 +116,54 @@ func senderClient(t *testing.T) *Matrix {
 	os.Setenv("WAYBACK_MATRIX_USERID", senderUID)
 	os.Setenv("WAYBACK_MATRIX_PASSWORD", senderPwd)
 	parser = config.NewParser()
-	if config.Opts, err = parser.ParseEnvironmentVariables(); err != nil {
+	opts, err := parser.ParseEnvironmentVariables()
+	if err != nil {
 		t.Fatalf("Parse environment variables or flags failed, error: %v", err)
 	}
-	pool := pooling.New(config.Opts.PoolingSize())
+
+	cfg := []pooling.Option{
+		pooling.Capacity(opts.PoolingSize()),
+		pooling.Timeout(opts.WaybackTimeout()),
+		pooling.MaxRetries(opts.WaybackMaxRetries()),
+	}
+	ctx := context.Background()
+	pool := pooling.New(ctx, cfg...)
+	go pool.Roll()
 	defer pool.Close()
 
-	return New(context.Background(), &storage.Storage{}, pool)
+	pub := publish.New(ctx, opts)
+	defer pub.Stop()
+
+	o := service.ParseOptions(service.Config(opts), service.Storage(&storage.Storage{}), service.Pool(pool), service.Publish(pub))
+	m, _ := New(ctx, o)
+	return m
 }
 
 func recverClient(t *testing.T) *Matrix {
 	os.Setenv("WAYBACK_MATRIX_USERID", recverUID)
 	os.Setenv("WAYBACK_MATRIX_PASSWORD", recverPwd)
 	parser = config.NewParser()
-	if config.Opts, err = parser.ParseEnvironmentVariables(); err != nil {
+	opts, err := parser.ParseEnvironmentVariables()
+	if err != nil {
 		t.Fatalf("Parse environment variables or flags failed, error: %v", err)
 	}
-	pool := pooling.New(config.Opts.PoolingSize())
+
+	cfg := []pooling.Option{
+		pooling.Capacity(opts.PoolingSize()),
+		pooling.Timeout(opts.WaybackTimeout()),
+		pooling.MaxRetries(opts.WaybackMaxRetries()),
+	}
+	ctx := context.Background()
+	pool := pooling.New(ctx, cfg...)
+	go pool.Roll()
 	defer pool.Close()
 
-	return New(context.Background(), &storage.Storage{}, pool)
+	pub := publish.New(ctx, opts)
+	defer pub.Stop()
+
+	o := service.ParseOptions(service.Config(opts), service.Storage(&storage.Storage{}), service.Pool(pool), service.Publish(pub))
+	m, _ := New(ctx, o)
+	return m
 }
 
 // nolint:gocyclo
@@ -119,6 +175,11 @@ func TestProcess(t *testing.T) {
 		t.Skip("Define RECVER_UID and RECVER_PWD environment variables to test Matrix")
 	}
 	done := make(chan bool, 1)
+
+	opts, err := parser.ParseEnvironmentVariables()
+	if err != nil {
+		t.Fatalf("Parse environment variables or flags failed, error: %v", err)
+	}
 
 	sender := senderClient(t)
 	recver := recverClient(t)
@@ -146,7 +207,7 @@ func TestProcess(t *testing.T) {
 
 	// Create a room and invite recver
 	resp, err := sender.client.CreateRoom(&matrix.ReqCreateRoom{
-		Invite:     []id.UserID{id.UserID(config.Opts.MatrixUserID())},
+		Invite:     []id.UserID{id.UserID(opts.MatrixUserID())},
 		Preset:     "trusted_private_chat",
 		Visibility: "private",
 		IsDirect:   true,
@@ -175,14 +236,15 @@ func TestProcess(t *testing.T) {
 		if ev.Sender == id.UserID(senderUID) {
 			t.Logf("Event id: %s, event type: %s, event content: %v", ev.ID, ev.Type.Type, ev.Content.AsMessage().Body)
 
-			if err := recver.process(ev); err != nil {
+			ctx := context.Background()
+			if err := recver.process(ctx, ev); err != nil {
 				t.Errorf("Process request failure, error: %v", err)
 			}
 			done <- true
 		}
 	})
 	recvSyncer.OnEventType(event.EventEncrypted, func(source matrix.EventSource, ev *event.Event) {
-		t.Log("Unsupport encryption message")
+		t.Log("Unsupported encryption message")
 		// logger.Debug("event: %v", ev)
 		// if err := m.process(context.Background(), ev); err != nil {
 		// 	logger.Error("process request failure, error: %v", err)
@@ -196,7 +258,7 @@ func TestProcess(t *testing.T) {
 			select {
 			case <-tick.C:
 				if i == 0 {
-					t.Error("Timeout while wating for test message from the other thread.")
+					t.Error("Timeout while waiting for test message from the other thread.")
 					sender.destroyRoomForTest(resp.RoomID)
 					recver.destroyRoomForTest(resp.RoomID)
 					time.Sleep(time.Second)

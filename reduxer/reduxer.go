@@ -7,24 +7,18 @@ package reduxer // import "github.com/wabarc/wayback/reduxer"
 import (
 	"bytes"
 	"context"
-	"net"
-	"net/http"
+	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/dustin/go-humanize"
-	"github.com/gabriel-vasile/mimetype"
 	"github.com/go-shiori/go-readability"
-	"github.com/iawia002/annie/downloader"
-	"github.com/iawia002/annie/extractors"
-	"github.com/iawia002/annie/extractors/types"
-	"github.com/wabarc/go-anonfile"
+	"github.com/go-shiori/obelisk"
 	"github.com/wabarc/go-catbox"
 	"github.com/wabarc/helper"
 	"github.com/wabarc/logger"
@@ -32,443 +26,363 @@ import (
 	"github.com/wabarc/warcraft"
 	"github.com/wabarc/wayback/config"
 	"github.com/wabarc/wayback/errors"
+	"github.com/wabarc/wayback/ingress"
 	"golang.org/x/sync/errgroup"
 )
 
-// Bundle represents a bundle data of a webpage.
-type Bundle struct {
-	screenshot.Screenshots
+const timeout = 30 * time.Second
 
-	Assets  Assets
-	Article readability.Article
+var (
+	ctxBasenameKey struct{}
+
+	filePerm = os.FileMode(0o600)
+)
+
+// Reduxer is the interface that wraps the basic reduxer method.
+//
+// Store sets the *bundle for a Src.
+//
+// Load returns the data stored in the map for a Src, or nil if no value is
+// present. The ok result indicates whether value was found in the map.
+//
+// Flush erases all bundles from the cache.
+type Reduxer interface {
+	Store(Src, *bundle)
+	Load(Src) (*bundle, bool)
+	Flush()
 }
 
-// Assets represents the file paths stored on the local disk.
-type Assets struct {
-	Img, PDF, Raw, Txt, HAR, WARC, Media Asset
+// bundle represents a bundle data of a webpage.
+type bundle struct {
+	artifact Artifact
+	article  readability.Article
+	shots    *screenshot.Screenshots[screenshot.Path]
+}
+
+// Artifact represents the file paths stored on the local disk.
+type Artifact struct {
+	Img, PDF, Raw, Txt, HAR, HTM, WARC, Media Asset
 }
 
 // Asset represents the files on the local disk and the remote servers.
 type Asset struct {
-	Local  string
 	Remote Remote
+	Local  string
 }
 
 // Remote represents the file on the remote server.
 type Remote struct {
-	Anonfile string
-	Catbox   string
+	Catbox string
 }
 
-// Bundles represents a set of the Bundle in a map, and its key is a URL string.
-type Bundles map[string]*Bundle
+// Src represents the requested url.
+type Src string
 
-var _, existFFmpeg = exists("ffmpeg")
-var youget, existYouGet = exists("you-get")
-var ytdl, existYoutubeDL = exists("youtube-dl")
+// bundles represents a set of the bundle in a map, and its key is a URL string.
+type bundles struct {
+	mutex sync.RWMutex
+	dirty map[Src]*bundle
+}
+
+// NewReduxer returns a Reduxer has been initialized.
+func NewReduxer() Reduxer {
+	return &bundles{
+		mutex: sync.RWMutex{},
+		dirty: make(map[Src]*bundle),
+	}
+}
+
+// Store sets the *bundle for a Src.
+func (bs *bundles) Store(key Src, b *bundle) {
+	bs.mutex.Lock()
+	if bs.dirty == nil {
+		bs.dirty = make(map[Src]*bundle)
+	}
+	bs.dirty[key] = b
+	bs.mutex.Unlock()
+}
+
+// Load returns the data stored in the map for a Src, or nil if no value is
+// present. The ok result indicates whether value was found in the map.
+func (bs *bundles) Load(key Src) (v *bundle, ok bool) {
+	bs.mutex.RLock()
+	v, ok = bs.dirty[key]
+	bs.mutex.RUnlock()
+	return
+}
+
+// Flush removes all bundles from the cache.
+func (bs *bundles) Flush() {
+	for key := range bs.dirty {
+		bs.mutex.Lock()
+		delete(bs.dirty, key)
+		bs.mutex.Unlock()
+	}
+}
+
+// Shots returns a screenshot.Screenshots from bundle.
+func (b *bundle) Shots() *screenshot.Screenshots[screenshot.Path] {
+	return b.shots
+}
+
+// Artifact returns an Artifact from bundle.
+func (b *bundle) Artifact() Artifact {
+	return b.artifact
+}
+
+// Article returns a readability.Article from bundle.
+func (b *bundle) Article() readability.Article {
+	return b.article
+}
 
 // Do executes secreenshot, print PDF and export html of given URLs
 // Returns a set of bundle containing screenshot data and file path
 // nolint:gocyclo
-func Do(ctx context.Context, urls ...string) (bundles Bundles, err error) {
-	bundles = make(Bundles)
-	if !config.Opts.EnabledReduxer() {
-		return bundles, errors.New("Specify directory to environment `WAYBACK_STORAGE_DIR` to enable reduxer")
+func Do(ctx context.Context, opts *config.Options, urls ...*url.URL) (Reduxer, error) {
+	// Returns an initialized Reduxer for safe.
+	var bs = NewReduxer()
+	var err error
+
+	if !opts.EnabledReduxer() {
+		return bs, errors.New("Specify directory to environment `WAYBACK_STORAGE_DIR` to enable reduxer")
 	}
 
-	shots, err := Capture(ctx, urls...)
+	// No supported browser found, returns empty results to ensure archives are normal.
+	if _, err = exec.LookPath(helper.FindChromeExecPath()); err != nil {
+		logger.Debug("No browser detected, no artifacts scraped.")
+		return bs, nil
+	}
+
+	dir, err := createDir(opts.StorageDir())
 	if err != nil {
-		return bundles, err
+		return bs, errors.Wrap(err, "create storage directory failed")
 	}
 
-	dir, err := createDir(config.Opts.StorageDir())
-	if err != nil {
-		return bundles, err
-	}
+	var warc = &warcraft.Warcraft{BasePath: dir, UserAgent: opts.WaybackUserAgent()}
+	var craft = func(ctx context.Context, in *url.URL) (path string) {
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
 
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var warc = &warcraft.Warcraft{BasePath: dir, UserAgent: config.Opts.WaybackUserAgent()}
-	var craft = func(in string) string {
-		u, err := url.Parse(in)
+		path, err = warc.Download(ctx, in)
 		if err != nil {
-			logger.Debug("create warc for %s failed", u.String())
-			return ""
-		}
-		path, err := warc.Download(ctx, u)
-		if err != nil {
-			logger.Debug("create warc for %s failed: %v", u.String(), err)
+			logger.Debug("create warc for %s failed: %v", in, err)
 			return ""
 		}
 		return path
 	}
 
-	type m struct {
-		key *Asset
-		buf []byte
-	}
+	g, ctx := errgroup.WithContext(ctx)
+	for _, uri := range urls {
+		uri := uri
+		g.Go(func() error {
+			basename := strings.TrimSuffix(helper.FileName(uri.String(), ""), ".html")
+			basename = strings.TrimSuffix(basename, ".htm")
+			ctx = context.WithValue(ctx, ctxBasenameKey, basename) // nolint:staticcheck
 
-	for _, shot := range shots {
-		wg.Add(1)
-		go func(shot screenshot.Screenshots) {
-			defer wg.Done()
+			shot, er := capture(ctx, opts, uri, dir)
+			if er != nil {
+				return errors.Wrap(er, "capture failed")
+			}
+			logger.Debug("capture results: %#v", shot)
 
-			var assets Assets
-			slugs := []m{
-				{key: &assets.Img, buf: shot.Image},
-				{key: &assets.PDF, buf: shot.PDF},
-				{key: &assets.Raw, buf: shot.HTML},
-				{key: &assets.HAR, buf: shot.HAR},
+			artifact := &Artifact{
+				Img:  Asset{Local: fmt.Sprint(shot.Image)},
+				Raw:  Asset{Local: fmt.Sprint(shot.HTML)},
+				PDF:  Asset{Local: fmt.Sprint(shot.PDF)},
+				HAR:  Asset{Local: fmt.Sprint(shot.HAR)},
+				WARC: Asset{Local: craft(ctx, uri)},
 			}
-			for _, slug := range slugs {
-				if slug.buf == nil {
-					logger.Warn("file empty, skipped")
-					continue
-				}
-				mt := mimetype.Detect(slug.buf)
-				ft := mt.String()
-				fp := filepath.Join(dir, helper.FileName(shot.URL, ft))
-				// Replace json with har
-				if strings.HasSuffix(fp, ".json") {
-					fp = strings.TrimSuffix(fp, ".json") + mt.Extension()
-				}
-				logger.Debug("writing file: %s", fp)
-				if err := os.WriteFile(fp, slug.buf, 0o600); err != nil {
-					logger.Error("write %s file failed: %v", ft, err)
-					continue
-				}
-				if err := helper.SetField(slug.key, "Local", fp); err != nil {
-					logger.Error("assign field %s to path struct failed: %v", slug.key, err)
-					continue
-				}
+
+			fp := filepath.Join(dir, basename)
+			m := media{
+				dir:  dir,
+				path: fp,
+				name: basename,
+				url:  shot.URL,
 			}
-			// Set path of WARC file directly to avoid read file as buffer
-			if err := helper.SetField(&assets.WARC, "Local", craft(shot.URL)); err != nil {
-				logger.Error("assign field WARC to path struct failed: %v", err)
+
+			if supportedMediaSite(uri) {
+				artifact.Media.Local = m.download(ctx, opts)
 			}
-			if err := helper.SetField(&assets.Media, "Local", media(ctx, dir, shot.URL)); err != nil {
-				logger.Error("assign field Media to path struct failed: %v", err)
+			// Attach single file
+			var buf []byte
+			var article readability.Article
+			buf, err = os.ReadFile(fmt.Sprint(shot.HTML))
+			if err == nil {
+				singleFilePath := singleFile(ctx, opts, bytes.NewReader(buf), dir, shot.URL)
+				artifact.HTM.Local = singleFilePath
 			}
-			u, _ := url.Parse(shot.URL)
-			article, err := readability.FromReader(bytes.NewReader(shot.HTML), u)
+			article, err = readability.FromReader(bytes.NewReader(buf), uri)
 			if err != nil {
 				logger.Error("parse html failed: %v", err)
 			}
-			fn := strings.TrimRight(helper.FileName(shot.URL, ""), "html") + "txt"
-			fp := filepath.Join(dir, fn)
-			if err := os.WriteFile(fp, []byte(article.TextContent), 0o600); err == nil && article.TextContent != "" {
-				if err := helper.SetField(&assets.Txt, "Local", fp); err != nil {
-					logger.Error("assign field Txt to assets struct failed: %v", err)
-				}
+			txtName := basename + ".txt"
+			fp = filepath.Join(dir, txtName)
+			if err = os.WriteFile(fp, helper.String2Byte(article.TextContent), filePerm); err == nil && article.TextContent != "" {
+				artifact.Txt.Local = fp
 			}
 			// Upload files to third-party server
-			if err := remotely(ctx, &assets); err != nil {
-				logger.Error("upload files to third-party failed: %v", err)
+			if err = remotely(ctx, artifact); err != nil {
+				logger.Error("upload files to remote server failed: %v", err)
 			}
-			bundle := &Bundle{shot, assets, article}
-			mu.Lock()
-			bundles[shot.URL] = bundle
-			mu.Unlock()
-		}(shot)
+			bundle := &bundle{shots: shot, artifact: *artifact, article: article}
+			bs.Store(Src(shot.URL), bundle)
+			return nil
+		})
 	}
-	wg.Wait()
+	if err = g.Wait(); err != nil {
+		return bs, errors.Wrap(err, "reduxer failed")
+	}
 
-	return bundles, nil
+	return bs, err
 }
 
-// Capture returns screenshot.Screenshots of given URLs
-func Capture(ctx context.Context, urls ...string) (shots []screenshot.Screenshots, err error) {
+// capture returns screenshot.Screenshots of given URLs
+func capture(ctx context.Context, cfg *config.Options, uri *url.URL, dir string) (shot *screenshot.Screenshots[screenshot.Path], err error) {
+	filename := basename(ctx)
+	files := screenshot.Files{
+		Image: filepath.Join(dir, filename+".png"),
+		HTML:  filepath.Join(dir, filename+".html"),
+		PDF:   filepath.Join(dir, filename+".pdf"),
+		HAR:   filepath.Join(dir, filename+".har"),
+	}
 	opts := []screenshot.ScreenshotOption{
+		screenshot.AppendToFile(files),
 		screenshot.ScaleFactor(1),
 		screenshot.PrintPDF(true), // print pdf
 		screenshot.DumpHAR(true),  // export har
 		screenshot.RawHTML(true),  // export html
 		screenshot.Quality(100),   // image quality
 	}
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	shots = make([]screenshot.Screenshots, 0, len(urls))
-	for _, uri := range urls {
-		wg.Add(1)
-		go func(uri string) {
-			defer wg.Done()
-			input, err := url.Parse(uri)
-			if err != nil {
-				logger.Error("parse url failed: %v", err)
-				return
-			}
 
-			var shot screenshot.Screenshots
-			if remote := remoteHeadless(config.Opts.ChromeRemoteAddr()); remote != nil {
-				logger.Debug("reduxer using remote browser")
-				addr := remote.(*net.TCPAddr)
-				headless, er := screenshot.NewChromeRemoteScreenshoter(addr.String())
-				if er != nil {
-					logger.Error("screenshot failed: %v", er)
-					return
-				}
-				shot, err = headless.Screenshot(ctx, input, opts...)
-			} else {
-				logger.Debug("reduxer using local browser")
-				shot, err = screenshot.Screenshot(ctx, input, opts...)
-			}
-			if err != nil {
-				if err == context.DeadlineExceeded {
-					logger.Error("screenshot deadline: %v", err)
-					return
-				}
-				logger.Error("screenshot error: %v", err)
-				return
-			}
-			mu.Lock()
-			shots = append(shots, shot)
-			mu.Unlock()
-		}(uri)
-	}
-	wg.Wait()
-
-	return shots, nil
-}
-
-// Asset returns paths of asset on the local disk.
-func (b *Bundle) Asset() (paths []Asset) {
-	if b != nil {
-		logger.Debug("assets: %#v", b.Assets)
-		paths = []Asset{
-			b.Assets.Img,
-			b.Assets.PDF,
-			b.Assets.Raw,
-			b.Assets.Txt,
-			b.Assets.HAR,
-			b.Assets.WARC,
-			b.Assets.Media,
+	fallback := func() (*screenshot.Screenshots[screenshot.Path], error) {
+		logger.Debug("reduxer using local browser")
+		if os.Getenv("PROXY_SERVER") == "" {
+			os.Setenv("PROXY_SERVER", cfg.Proxy())
 		}
+		shot, err = screenshot.Screenshot[screenshot.Path](ctx, uri, opts...)
+		if err != nil {
+			if err == context.DeadlineExceeded {
+				return shot, errors.Wrap(err, "screenshot deadline")
+			}
+			return shot, errors.Wrap(err, "screenshot error")
+		}
+		return shot, err
 	}
-	return
-}
 
-func remoteHeadless(addr string) net.Addr {
-	conn, err := net.DialTimeout("tcp", addr, time.Second)
-	if err != nil {
-		return nil
+	// Try to take a screenshot with a remote headless browser
+	// Fallback to local browser if remote is unavailable
+	if remote := cfg.ChromeRemoteAddr(); remote != "" {
+		logger.Debug("reduxer using remote browser")
+		browser, er := screenshot.NewChromeRemoteScreenshoter[screenshot.Path](remote)
+		if er != nil {
+			logger.Warn("screenshot dial failed: %v", er)
+			return fallback()
+		}
+		shot, err = browser.Screenshot(ctx, uri, opts...)
+		if err != nil {
+			logger.Error("screenshot failed: %v", err)
+			return fallback()
+		}
+		return shot, nil
 	}
 
-	if conn != nil {
-		conn.Close()
-		return conn.RemoteAddr()
-	}
-	return nil
+	return fallback()
 }
 
 func createDir(baseDir string) (dir string, err error) {
 	dir = filepath.Join(baseDir, time.Now().Format("200601"))
+	if helper.Exists(dir) {
+		return
+	}
+	// nosemgrep
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		logger.Error("mkdir failed: %v", err)
-		return "", err
+		return "", errors.Wrap(err, "mkdir failed: "+dir)
 	}
 	return dir, nil
 }
 
-func exists(tool string) (string, bool) {
-	var locations []string
-	switch tool {
-	case "ffmpeg":
-		locations = []string{"ffmpeg", "ffmpeg.exe"}
-	case "youtube-dl":
-		locations = []string{"youtube-dl"}
-	case "you-get":
-		locations = []string{"you-get"}
+func remotely(ctx context.Context, artifact *Artifact) (err error) {
+	assets := []*Asset{
+		&artifact.Img,
+		&artifact.PDF,
+		&artifact.Raw,
+		&artifact.Txt,
+		&artifact.HAR,
+		&artifact.HTM,
+		&artifact.WARC,
+		&artifact.Media,
 	}
 
-	for _, path := range locations {
-		found, err := exec.LookPath(path)
-		if err == nil {
-			return found, found != ""
-		}
-	}
-
-	return "", false
-}
-
-// nolint:gocyclo
-func media(ctx context.Context, dir, in string) string {
-	logger.Debug("download media to %s, url: %s", dir, in)
-	fn := strings.TrimSuffix(helper.FileName(in, ""), ".html")
-	fp := filepath.Join(dir, fn)
-
-	// Glob files by given pattern and return first file
-	var match = func(pattern string) string {
-		paths, err := filepath.Glob(pattern)
-		if err != nil || len(paths) == 0 {
-			logger.Warn("file %s* not found", fp)
-			return ""
-		}
-		logger.Debug("matched paths: %v", paths)
-		return paths[0]
-	}
-
-	// Download media via youtube-dl
-	var viaYoutubeDL = func() string {
-		if !existYoutubeDL {
-			return ""
-		}
-		logger.Debug("download media via youtube-dl")
-
-		args := []string{
-			"--http-chunk-size=10M", "--prefer-free-formats", "--restrict-filenames",
-			"--no-color", "--rm-cache-dir", "--no-warnings", "--no-check-certificate",
-			"--no-progress", "--no-part", "--no-mtime", "--embed-subs", "--quiet",
-			"--ignore-errors", "--format=best[ext=mp4]/best", "--merge-output-format=mp4",
-			"--output=" + fp + ".%(ext)s", in,
-		}
-		if config.Opts.HasDebugMode() {
-			args = append(args, "--verbose", "--print-traffic")
-		}
-
-		cmd := exec.CommandContext(ctx, ytdl, args...)
-		logger.Debug("youtube-dl args: %s", cmd.String())
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			logger.Warn("start youtube-dl failed: %v", err)
-		}
-		logger.Debug("youtube-dl output: %s", out)
-
-		return match(fp + "*")
-	}
-
-	// Download media via you-get
-	var viaYouGet = func() string {
-		if !existYouGet || !existFFmpeg {
-			return ""
-		}
-		logger.Debug("download media via you-get")
-		args := []string{
-			"--output-filename=" + fp, in,
-		}
-		cmd := exec.CommandContext(ctx, youget, args...)
-		logger.Debug("youget args: %s", cmd.String())
-		if err := cmd.Run(); err != nil {
-			logger.Warn("run you-get failed: %v", err)
-		}
-		return match(fp + "*")
-	}
-
-	var viaAnnie = func() string {
-		if !existFFmpeg {
-			logger.Warn("missing FFmpeg, skipped")
-			return ""
-		}
-		// Download media via Annie
-		logger.Debug("download media via annie")
-		data, err := extractors.Extract(in, types.Options{})
-		if err != nil || len(data) == 0 {
-			logger.Warn("data empty or error %v", err)
-			return ""
-		}
-		dt := data[0]
-		dl := downloader.New(downloader.Options{
-			OutputPath:   dir,
-			OutputName:   fn,
-			MultiThread:  true,
-			ThreadNumber: 10,
-			ChunkSizeMB:  10,
-			Silent:       !config.Opts.HasDebugMode(),
-		})
-		sortedStreams := sortStreams(dt.Streams)
-		if len(sortedStreams) == 0 {
-			logger.Warn("stream not found")
-			return ""
-		}
-		streamName := sortedStreams[0].ID
-		stream, ok := dt.Streams[streamName]
-		if !ok {
-			logger.Warn("stream not found")
-			return ""
-		}
-		logger.Debug("stream size: %s", humanize.Bytes(uint64(stream.Size)))
-		if stream.Size > int64(config.Opts.MaxMediaSize()) {
-			logger.Warn("media size large than %s, skipped", humanize.Bytes(config.Opts.MaxMediaSize()))
-			return ""
-		}
-		if err := dl.Download(dt); err != nil {
-			logger.Error("download media failed: %v", err)
-			return ""
-		}
-		fp += "." + stream.Ext
-		return fp
-	}
-
-	v := viaYoutubeDL()
-	if v == "" {
-		v = viaYouGet()
-	}
-	if v == "" {
-		v = viaAnnie()
-	}
-	if !helper.Exists(v) {
-		logger.Warn("file %s not exists", fp)
-		return ""
-	}
-	mtype, _ := mimetype.DetectFile(v)
-	if strings.HasPrefix(mtype.String(), "video") || strings.HasPrefix(mtype.String(), "audio") {
-		return v
-	}
-
-	return ""
-}
-
-func sortStreams(streams map[string]*types.Stream) []*types.Stream {
-	sortedStreams := make([]*types.Stream, 0, len(streams))
-	for _, data := range streams {
-		sortedStreams = append(sortedStreams, data)
-	}
-	if len(sortedStreams) > 1 {
-		sort.Slice(
-			sortedStreams, func(i, j int) bool { return sortedStreams[i].Size > sortedStreams[j].Size },
-		)
-	}
-	return sortedStreams
-}
-
-func remotely(ctx context.Context, assets *Assets) (err error) {
-	v := []*Asset{
-		&assets.Img,
-		&assets.PDF,
-		&assets.Raw,
-		&assets.Txt,
-		&assets.HAR,
-		&assets.WARC,
-		&assets.Media,
-	}
-
-	c := &http.Client{}
-	cat := catbox.New(c)
-	anon := anonfile.NewAnonfile(c)
+	cat := catbox.New(ingress.Client())
 	g, _ := errgroup.WithContext(ctx)
-	for _, asset := range v {
-		if !helper.Exists(asset.Local) {
+
+	var mu sync.RWMutex
+	for _, asset := range assets {
+		asset := asset
+		if asset.Local == "" {
 			continue
 		}
-		asset := asset
+		if !helper.Exists(asset.Local) {
+			err = errors.Wrap(err, fmt.Sprintf("local asset: %s not exists", asset.Local))
+			continue
+		}
 		g.Go(func() error {
-			r, e := anon.Upload(asset.Local)
-			if e != nil {
-				err = errors.Wrap(err, e.Error())
-				return e
-			}
-			asset.Remote.Anonfile = r.Short()
+			var remote Remote
+			mu.Lock()
 			c, e := cat.Upload(asset.Local)
 			if e != nil {
-				err = errors.Wrap(err, e.Error())
-				return e
+				err = errors.Wrap(err, fmt.Sprintf("upload %s to catbox failed: %v", asset.Local, e))
+			} else {
+				remote.Catbox = c
 			}
-			asset.Remote.Catbox = c
+			asset.Remote = remote
+			mu.Unlock()
 			return nil
 		})
 	}
-	if err := g.Wait(); err != nil {
-		return err
-	}
+	// nolint:errcheck
+	_ = g.Wait()
 
 	return err
+}
+
+func singleFile(ctx context.Context, opts *config.Options, inp io.Reader, dir, uri string) string {
+	req := obelisk.Request{URL: uri, Input: inp}
+	arc := &obelisk.Archiver{
+		SkipResourceURLError: true,
+		RequestTimeout:       3 * time.Second,
+		EnableVerboseLog:     opts.HasDebugMode(),
+	}
+	arc.Validate()
+
+	content, _, err := arc.Archive(ctx, req)
+	if err != nil {
+		return ""
+	}
+
+	name := basename(ctx) + ".htm"
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, content, filePerm); err != nil {
+		return ""
+	}
+	return path
+}
+
+func basename(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxBasenameKey).(string); ok {
+		return v
+	}
+	return ""
+}
+
+func readOutput(rc io.ReadCloser) {
+	for {
+		out := make([]byte, 1024)
+		_, err := rc.Read(out)
+		logger.Info(string(out))
+		if err != nil {
+			break
+		}
+	}
 }

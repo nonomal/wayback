@@ -1,0 +1,58 @@
+# Copyright 2020 Wayback Archiver. All rights reserved.
+# Use of this source code is governed by the GNU GPL v3
+# license that can be found in the LICENSE file.
+#
+header:
+  license:
+    spdx-id: GPL-3.0-or-later
+    copyright-owner: Wayback Archiver
+    software-name: wayback
+    content: |
+      Copyright 2020 Wayback Archiver. All rights reserved.
+      Use of this source code is governed by the GNU GPL v3
+      license that can be found in the LICENSE file.
+
+  paths-ignore:
+    - '.github/ISSUE_TEMPLATE'
+    - '.github/PULL_REQUEST_TEMPLATE'
+    - '.github/linters/.dockerfilelintrc'
+    - '.gitattributes'
+    - '.semgrepignore'
+    - 'build/aur'
+    - 'build/binary'
+    - 'build/debian'
+    - 'build/package'
+    - 'build/docker/Dockerfile.*'
+    - 'build/systemd/wayback.service'
+    - 'docs/assets/*'
+    - '**/*.md'
+    - '**/*.out'
+    - '**/*.json'
+    - '**/go.mod'
+    - '**/go.sum'
+    - 'LICENSE'
+    - 'reduxer/sites'
+    - 'template/assets/**'
+    - 'template/views/*.html'
+    - 'wayback.1'
+    - 'wayback.conf'
+    - 'docker-bake.hcl'
+    - 'install.sh'
+    - 'Makefile'
+    - 'Procfile'
+    - 'cosign.pub'
+    - 'codecov.yml'
+    - 'mkdocs.yml'
+
+  comment: on-failure
+
+dependency:
+  files:
+    - go.mod
+  licenses:
+    - name: github.com/multiformats/go-base36
+      version: v0.2.0
+      license: Apache-2.0 OR MIT
+    - name: github.com/multiformats/go-multicodec
+      version: v0.9.0
+      license: Apache-2.0 OR MIT

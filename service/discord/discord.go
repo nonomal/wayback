@@ -7,10 +7,12 @@ package discord // import "github.com/wabarc/wayback/service/discord"
 import (
 	"context"
 	"encoding/base64"
+	"net/url"
 	"strconv"
 	"strings"
 
-	"github.com/fatih/color"
+	"github.com/gookit/color"
+	"github.com/wabarc/helper"
 	"github.com/wabarc/logger"
 	"github.com/wabarc/wayback"
 	"github.com/wabarc/wayback/config"
@@ -27,6 +29,9 @@ import (
 	discord "github.com/bwmarrin/discordgo"
 )
 
+// Interface guard
+var _ service.Servicer = (*Discord)(nil)
+
 // ErrServiceClosed is returned by the Service's Serve method after a call to Shutdown.
 var ErrServiceClosed = errors.New("discord: Service closed")
 
@@ -36,26 +41,22 @@ type Discord struct {
 
 	bot   *discord.Session
 	store *storage.Storage
-	pool  pooling.Pool
+	opts  *config.Options
+	pool  *pooling.Pool
+	pub   *publish.Publish
 }
 
 // New returns a Discord struct.
-func New(ctx context.Context, store *storage.Storage, pool pooling.Pool) *Discord {
-	if config.Opts.DiscordBotToken() == "" {
-		logger.Fatal("missing required environment variable")
+func New(ctx context.Context, opts service.Options) (*Discord, error) {
+	if !opts.Config.DiscordEnabled() {
+		return nil, errors.New("missing required environment variable, skipped")
 	}
-	if store == nil {
-		logger.Fatal("must initialize storage")
-	}
-	if pool == nil {
-		logger.Fatal("must initialize pooling")
-	}
-	bot, err := discord.New("Bot " + config.Opts.DiscordBotToken())
+	bot, err := discord.New("Bot " + opts.Config.DiscordBotToken())
 	if err != nil {
-		logger.Fatal("create discord bot instance failed: %v", err)
+		return nil, errors.Wrap(err, "create discord bot instance failed")
 	}
 	// Debug mode for bwmarrin/discordgo will print the bot token, should not apply it on production
-	// if config.Opts.HasDebugMode() {
+	// if opts.Config.HasDebugMode() {
 	//     bot.LogLevel = discord.LogDebug
 	// }
 
@@ -66,9 +67,11 @@ func New(ctx context.Context, store *storage.Storage, pool pooling.Pool) *Discor
 	return &Discord{
 		ctx:   ctx,
 		bot:   bot,
-		store: store,
-		pool:  pool,
-	}
+		store: opts.Storage,
+		opts:  opts.Config,
+		pool:  opts.Pool,
+		pub:   opts.Publish,
+	}, nil
 }
 
 // Serve loop request message from the Discord api server.
@@ -78,11 +81,11 @@ func (d *Discord) Serve() (err error) {
 		return errors.New("Initialize discord failed, error: %v", err)
 	}
 	d.bot.AddHandler(func(s *discord.Session, _ *discord.Ready) {
-		logger.Info("authorized on account %s", color.BlueString(s.State.User.Username))
+		logger.Info("authorized on account %s", color.Blue.Sprint(s.State.User.Username))
 	})
 
-	if channel, err := d.bot.UserChannelCreate(config.Opts.DiscordChannel()); err == nil {
-		logger.Info("channel name: %s, channel id: %s", color.BlueString(channel.Name), color.BlueString(channel.ID))
+	if channel, err := d.bot.UserChannelCreate(d.opts.DiscordChannel()); err == nil {
+		logger.Info("channel name: %s, channel id: %s", color.Blue.Sprint(channel.Name), color.Blue.Sprint(channel.ID))
 	}
 
 	commandHandlers := d.commandHandlers()
@@ -122,6 +125,7 @@ func (d *Discord) Serve() (err error) {
 				m.Message.Content += msg.Content
 			}
 		}
+		// nolint:errcheck
 		d.process(m)
 	})
 
@@ -134,6 +138,7 @@ func (d *Discord) Serve() (err error) {
 	d.bot.AddHandler(func(s *discord.Session, _ *discord.Ready) {
 		logger.Debug("set global commands")
 		// Set global bot commands
+		// nolint:errcheck
 		d.setCommands("")
 	})
 
@@ -162,21 +167,23 @@ func (d *Discord) Shutdown() error {
 func (d *Discord) commandHandlers() map[string]func(*discord.Session, *discord.InteractionCreate) {
 	return map[string]func(s *discord.Session, i *discord.InteractionCreate){
 		"help": func(s *discord.Session, i *discord.InteractionCreate) {
+			// nolint:errcheck
 			s.InteractionRespond(i.Interaction, &discord.InteractionResponse{
 				Type: discord.InteractionResponseChannelMessageWithSource,
 				Data: &discord.InteractionResponseData{
-					Content: config.Opts.DiscordHelptext(),
+					Content: d.opts.DiscordHelptext(),
 				},
 			})
 		},
 		"playback": func(s *discord.Session, i *discord.InteractionCreate) {
-			d.playback(s, i)
+			d.playback(s, i) // nolint:errcheck
 		},
 		"metrics": func(s *discord.Session, i *discord.InteractionCreate) {
 			stats := metrics.Gather.Export("wayback")
-			if !config.Opts.EnabledMetrics() || stats == "" {
+			if !d.opts.EnabledMetrics() || stats == "" {
 				return
 			}
+			// nolint:errcheck
 			s.InteractionRespond(i.Interaction, &discord.InteractionResponse{
 				Type: discord.InteractionResponseChannelMessageWithSource,
 				Data: &discord.InteractionResponseData{
@@ -198,7 +205,13 @@ func (d *Discord) buttonHandlers() map[string]func(*discord.Session, *discord.In
 			}
 
 			// Query playback callback data from database
-			pb, err := d.store.Playback(id)
+			x := strconv.Itoa(id)
+			u, err := strconv.ParseUint(x, 10, 64)
+			if err != nil {
+				logger.Error("parse uint failed: %v", err)
+				return
+			}
+			pb, err := d.store.Playback(u)
 			if err != nil {
 				logger.Error("query playback data failed: %v", err)
 				metrics.IncrementWayback(metrics.ServiceDiscord, metrics.StatusFailure)
@@ -213,6 +226,7 @@ func (d *Discord) buttonHandlers() map[string]func(*discord.Session, *discord.In
 			}
 
 			// Send an interaction respond to markup interact status
+			// nolint:errcheck
 			s.InteractionRespond(i.Interaction, &discord.InteractionResponse{
 				Type: discord.InteractionResponseChannelMessageWithSource,
 				Data: &discord.InteractionResponseData{
@@ -220,12 +234,12 @@ func (d *Discord) buttonHandlers() map[string]func(*discord.Session, *discord.In
 				},
 			})
 
+			// nolint:errcheck
 			s.ChannelTyping(i.Message.ChannelID)
 
-			i.Message.Content = string(data)
-			d.process(&discord.MessageCreate{Message: i.Message})
-			s.InteractionResponseDelete(s.State.User.ID, i.Interaction)
-			return
+			i.Message.Content = helper.Byte2String(data)
+			d.process(&discord.MessageCreate{Message: i.Message}) // nolint:errcheck
+			s.InteractionResponseDelete(i.Interaction)            // nolint:errcheck
 		},
 	}
 }
@@ -235,7 +249,7 @@ func (d *Discord) process(m *discord.MessageCreate) (err error) {
 	content := m.Content
 	logger.Debug("content: %s", content)
 
-	urls := service.MatchURL(content)
+	urls := service.MatchURL(d.opts, content)
 
 	switch {
 	case m.GuildID != "" && !d.isMention(content):
@@ -244,27 +258,38 @@ func (d *Discord) process(m *discord.MessageCreate) (err error) {
 	case len(urls) == 0:
 		logger.Warn("archives failure, URL no found.")
 		metrics.IncrementWayback(metrics.ServiceDiscord, metrics.StatusRequest)
-		d.reply(m, "URL no found.")
+		d.reply(m, "URL no found.") // nolint:errcheck
 	default:
 		metrics.IncrementWayback(metrics.ServiceDiscord, metrics.StatusRequest)
 		if m, err = d.reply(m, "Queue..."); err != nil {
 			logger.Error("reply queue failed: %v", err)
 			return
 		}
-		d.pool.Roll(func() {
-			logger.Debug("content: %v", urls)
-			if err := d.wayback(d.ctx, m, urls); err != nil {
-				logger.Error("archives failed: %v", err)
+		bucket := pooling.Bucket{
+			Request: func(ctx context.Context) error {
+				logger.Debug("content: %v", urls)
+				if err := d.wayback(ctx, m, urls); err != nil {
+					logger.Error("archives failed: %v", err)
+					// nolint:errcheck
+					d.reply(m, service.MsgWaybackRetrying)
+					return err
+				}
+				metrics.IncrementWayback(metrics.ServiceDiscord, metrics.StatusSuccess)
+				return nil
+			},
+			Fallback: func(_ context.Context) error {
+				// nolint:errcheck
+				d.reply(m, service.MsgWaybackTimeout)
 				metrics.IncrementWayback(metrics.ServiceDiscord, metrics.StatusFailure)
-				return
-			}
-			metrics.IncrementWayback(metrics.ServiceDiscord, metrics.StatusSuccess)
-		})
+				return nil
+			},
+		}
+		d.pool.Put(bucket)
 	}
 	return nil
 }
 
-func (d *Discord) wayback(ctx context.Context, m *discord.MessageCreate, urls []string) error {
+func (d *Discord) wayback(ctx context.Context, m *discord.MessageCreate, urls []*url.URL) error {
 	stage, err := d.edit(m, "Archiving...")
 	if err != nil {
 		logger.Error("send archiving message failed: %v", err)
@@ -272,53 +297,47 @@ func (d *Discord) wayback(ctx context.Context, m *discord.MessageCreate, urls []
 	}
 	logger.Debug("send archiving message result: %#v", stage)
 
-	var bundles reduxer.Bundles
-	cols, err := wayback.Wayback(ctx, &bundles, urls...)
-	if err != nil {
-		logger.Error("archives failed: %v", err)
-		return err
-	}
-	logger.Debug("bundles: %#v", bundles)
+	do := func(cols []wayback.Collect, rdx reduxer.Reduxer) error {
+		replyText := render.ForReply(&render.Discord{Cols: cols}).String()
+		logger.Debug("reply text, %s", replyText)
 
-	replyText := render.ForReply(&render.Discord{Cols: cols}).String()
-	logger.Debug("reply text, %s", replyText)
+		if _, err := d.edit(stage, replyText); err != nil {
+			return errors.Wrap(err, "discord: update message failed")
+		}
 
-	if _, err := d.edit(stage, replyText); err != nil {
-		logger.Error("update message failed: %v", err)
-		return err
-	}
+		// Avoid republishing
+		if m.ChannelID != d.opts.DiscordChannel() {
+			d.pub.Spread(ctx, rdx, cols, publish.FlagDiscord)
+		}
 
-	// Avoid publish repeat
-	if m.ChannelID != config.Opts.DiscordChannel() {
-		ctx = context.WithValue(ctx, publish.FlagDiscord, d.bot)
-		ctx = context.WithValue(ctx, publish.PubBundle, bundles)
-		go publish.To(ctx, cols, publish.FlagDiscord.String())
-	}
+		msg := &discord.MessageSend{Content: replyText, Reference: stage.Message.Reference()}
+		var files []*discord.File
+		for _, u := range urls {
+			if bundle, ok := rdx.Load(reduxer.Src(u.String())); ok {
+				files = append(files, service.UploadToDiscord(d.opts, bundle.Artifact())...)
+			}
+		}
+		if len(files) == 0 {
+			logger.Warn("files empty")
+			return nil
+		}
+		msg.Files = files
 
-	msg := &discord.MessageSend{Content: replyText, Reference: stage.Message.Reference()}
-	var files []*discord.File
-	for _, bundle := range bundles {
-		files = append(files, publish.UploadToDiscord(bundle)...)
-	}
-	if len(files) == 0 {
-		logger.Warn("files empty")
+		if _, err := d.bot.ChannelMessageSendComplex(m.ChannelID, msg); err != nil {
+			logger.Error("post message to channel failed, %v", err)
+			return err
+		}
 		return nil
 	}
-	msg.Files = files
 
-	if _, err := d.bot.ChannelMessageSendComplex(m.ChannelID, msg); err != nil {
-		logger.Error("post message to channel failed, %v", err)
-		return err
-	}
-
-	return nil
+	return service.Wayback(ctx, d.opts, urls, do)
 }
 
 func (d *Discord) playback(s *discord.Session, i *discord.InteractionCreate) error {
 	metrics.IncrementPlayback(metrics.ServiceDiscord, metrics.StatusRequest)
 
 	text := i.ApplicationCommandData().Options[0].StringValue()
-	urls := service.MatchURL(text)
+	urls := service.MatchURL(d.opts, text)
 	if len(urls) == 0 {
 		return d.bot.InteractionRespond(i.Interaction, &discord.InteractionResponse{
 			Type: discord.InteractionResponseChannelMessageWithSource,
@@ -328,35 +347,41 @@ func (d *Discord) playback(s *discord.Session, i *discord.InteractionCreate) err
 		})
 	}
 
-	s.InteractionRespond(i.Interaction, &discord.InteractionResponse{
+	err := s.InteractionRespond(i.Interaction, &discord.InteractionResponse{
 		Type: discord.InteractionResponseChannelMessageWithSource,
 		Data: &discord.InteractionResponseData{
 			Content: "Processing...",
 		},
 	})
+	if err != nil {
+		return errors.Wrap(err, "discord: playback hint failed")
+	}
 
-	cols, _ := wayback.Playback(d.ctx, urls...)
+	cols, err := wayback.Playback(d.ctx, d.opts, urls...)
+	if err != nil {
+		return errors.Wrap(err, "discord: playback failed")
+	}
 	logger.Debug("playback collections: %#v", cols)
 
 	// Due to Discord restricted custom_id up to 100 characters, it requires to store
 	// playback URLs to database.
-	pb := &entity.Playback{Source: base64.StdEncoding.EncodeToString([]byte(text))}
-	if err := d.store.CreatePlayback(pb); err != nil {
+	pb := &entity.Playback{Source: base64.StdEncoding.EncodeToString(helper.String2Byte(text))}
+	if err = d.store.CreatePlayback(pb); err != nil {
 		logger.Error("store collections failed: %v", err)
 		return err
 	}
 
 	replyText := render.ForReply(&render.Discord{Cols: cols}).String()
-	err := s.InteractionResponseEdit(s.State.User.ID, i.Interaction, &discord.WebhookEdit{
-		Content: replyText,
-		Components: []discord.MessageComponent{
+	_, err = s.InteractionResponseEdit(i.Interaction, &discord.WebhookEdit{
+		Content: &replyText,
+		Components: &[]discord.MessageComponent{
 			discord.ActionsRow{
 				Components: []discord.MessageComponent{
 					discord.Button{
 						Label:    "wayback",
 						Style:    discord.SuccessButton,
 						Disabled: false,
-						CustomID: strconv.Itoa(pb.ID),
+						CustomID: strconv.FormatUint(pb.ID, 10),
 					},
 				},
 			},
@@ -402,7 +427,7 @@ func (d *Discord) edit(m *discord.MessageCreate, text string) (*discord.MessageC
 }
 
 func (d *Discord) setCommands(guild string) (err error) {
-	if _, err = d.bot.ApplicationCommandBulkOverwrite(d.bot.State.User.ID, guild, requires()); err != nil {
+	if _, err = d.bot.ApplicationCommandBulkOverwrite(d.bot.State.User.ID, guild, d.requires()); err != nil {
 		logger.Error("overwrite commands failed: %v", err)
 		return err
 	}
@@ -411,14 +436,14 @@ func (d *Discord) setCommands(guild string) (err error) {
 	return nil
 }
 
-func requires() (commands []*discord.ApplicationCommand) {
-	if config.Opts.DiscordHelptext() != "" {
+func (d *Discord) requires() (commands []*discord.ApplicationCommand) {
+	if d.opts.DiscordHelptext() != "" {
 		commands = append(commands, &discord.ApplicationCommand{
 			Name:        "help",
 			Description: "Show help information",
 		})
 	}
-	if config.Opts.EnabledMetrics() {
+	if d.opts.EnabledMetrics() {
 		commands = append(commands, &discord.ApplicationCommand{
 			Name:        "metrics",
 			Description: "Show service metrics",

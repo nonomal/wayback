@@ -1,4 +1,4 @@
-// Copyright 2020 Wayback Archiver. All rights reserved.
+// Copyright 2023 Wayback Archiver. All rights reserved.
 // Use of this source code is governed by the GNU GPL v3
 // license that can be found in the LICENSE file.
 
@@ -6,314 +6,118 @@ package httpd // import "github.com/wabarc/wayback/service/httpd"
 
 import (
 	"context"
-	"encoding/json"
-	"mime"
 	"net/http"
-	"path"
-	"strings"
+	"sync"
+	"time"
 
-	"github.com/gorilla/mux"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/cretz/bine/tor"
+	"github.com/gookit/color"
 	"github.com/wabarc/logger"
-	"github.com/wabarc/wayback"
 	"github.com/wabarc/wayback/config"
-	"github.com/wabarc/wayback/metrics"
+	"github.com/wabarc/wayback/errors"
 	"github.com/wabarc/wayback/pooling"
 	"github.com/wabarc/wayback/publish"
-	"github.com/wabarc/wayback/reduxer"
 	"github.com/wabarc/wayback/service"
-	"github.com/wabarc/wayback/template"
-	"github.com/wabarc/wayback/version"
+	"github.com/wabarc/wayback/storage"
 )
 
-type web struct {
-	router   *mux.Router
-	template *template.Template
+// Interface guard
+var _ service.Servicer = (*Httpd)(nil)
+
+// ErrServiceClosed is returned by the Service's Serve method after a call to Shutdown.
+var ErrServiceClosed = errors.New("httpd: Service closed")
+
+// Httpd represents a http server in the application.
+type Httpd struct {
+	sync.RWMutex
+
+	ctx   context.Context
+	pub   *publish.Publish
+	opts  *config.Options
+	pool  *pooling.Pool
+	store *storage.Storage
+
+	tor    *tor.Tor
+	server *http.Server
 }
 
-func newWeb() *web {
-	router := mux.NewRouter()
-	web := &web{
-		router:   router,
-		template: template.New(router),
+// New a Httpd struct.
+func New(ctx context.Context, opts service.Options) (*Httpd, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if err := web.template.ParseTemplates(); err != nil {
-		logger.Fatal("unable to parse templates: %v", err)
-	}
-	if err := template.GenerateJavascriptBundles(); err != nil {
-		logger.Fatal("unable to generate JavaScript bundles: %v", err)
-	}
-	return web
+
+	return &Httpd{
+		ctx:   ctx,
+		store: opts.Storage,
+		opts:  opts.Config,
+		pool:  opts.Pool,
+		pub:   opts.Publish,
+	}, nil
 }
 
-func (web *web) handle(pool pooling.Pool) http.Handler {
-	web.router.HandleFunc("/", web.home)
-	web.router.HandleFunc("/{name}.js", web.showJavascript).Name("javascript").Methods(http.MethodGet)
-	web.router.HandleFunc("/favicon.ico", web.showFavicon).Name("favicon").Methods(http.MethodGet)
-	web.router.HandleFunc("/icon/{filename}", web.showAppIcon).Name("icon").Methods(http.MethodGet)
-	web.router.HandleFunc("/manifest.json", web.showWebManifest).Name("manifest").Methods(http.MethodGet)
-	web.router.HandleFunc("/offline.html", web.showOfflinePage).Methods(http.MethodGet)
+// Serve accepts incoming HTTP requests over Tor network, or open
+// a local port for proxy server by "WAYBACK_ONION_LOCAL_PORT" env.
+// Use "WAYBACK_ONION_PRIVKEY" to keep the Tor hidden service hostname.
+//
+// Serve always returns an error.
+func (h *Httpd) Serve() error {
+	// Start tor with some defaults + elevated verbosity
+	logger.Info("starting and registering onion service, please wait a bit...")
 
-	web.router.HandleFunc("/wayback", func(w http.ResponseWriter, r *http.Request) {
-		pool.Roll(func() {
-			web.process(w, r)
-		})
-	}).Methods(http.MethodPost)
-	web.router.HandleFunc("/playback", web.playback).Methods(http.MethodPost)
-
-	web.router.HandleFunc("/healthcheck", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
-	}).Name("healthcheck")
-	web.router.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(version.Version))
-	}).Name("version")
-	if config.Opts.EnabledMetrics() {
-		web.router.Handle("/metrics", promhttp.Handler()).Methods(http.MethodGet)
+	handler := newWeb(h.ctx, h.opts, h.pool, h.pub).handle()
+	server := &http.Server{
+		ReadTimeout:  5 * time.Minute,
+		WriteTimeout: 5 * time.Minute,
+		IdleTimeout:  5 * time.Minute,
+		Handler:      handler,
 	}
 
-	web.router.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		w.Write([]byte("User-agent: *\nDisallow: /"))
-	})
-
-	return web.router
-}
-
-func (web *web) home(w http.ResponseWriter, r *http.Request) {
-	logger.Debug("access home")
-	w.Header().Set("Cache-Control", "max-age=2592000")
-	if html, ok := web.template.Render("layout", nil); ok {
-		w.Write(html)
-	} else {
-		logger.Error("render template for home request failed")
-		http.Error(w, "Internal Server Error", 500)
-	}
-}
-
-func (web *web) showOfflinePage(w http.ResponseWriter, r *http.Request) {
-	logger.Debug("access offline page")
-	// if f, ok := w.(http.Flusher); ok {
-	// 	f.Flush()
-	// }
-	if html, ok := web.template.Render("offline", nil); ok {
-		w.Write(html)
-	} else {
-		logger.Error("render template for offline request failed")
-		http.Error(w, "Internal Server Error", 500)
-	}
-}
-
-func (web *web) showWebManifest(w http.ResponseWriter, r *http.Request) {
-	logger.Debug("access manifest")
-	type webManifestIcon struct {
-		Source string `json:"src"`
-		Sizes  string `json:"sizes"`
-		Type   string `json:"type"`
-	}
-
-	type webManifest struct {
-		Name        string            `json:"name"`
-		Description string            `json:"description"`
-		ShortName   string            `json:"short_name"`
-		StartURL    string            `json:"start_url"`
-		Icons       []webManifestIcon `json:"icons"`
-		Display     string            `json:"display"`
-		ThemeColor  string            `json:"theme_color"`
-	}
-
-	manifest := &webManifest{
-		Name:        "Wayback Archiver",
-		ShortName:   "Wayback",
-		Description: "A toolkit for snapshot webpages",
-		Display:     "standalone",
-		ThemeColor:  "#f7f7f7",
-		StartURL:    "/",
-		Icons: []webManifestIcon{
-			{Source: template.Path(web.router, "icon", "filename", "icon-120.png"), Sizes: "120x120", Type: "image/png"},
-			{Source: template.Path(web.router, "icon", "filename", "icon-192.png"), Sizes: "192x192", Type: "image/png"},
-			{Source: template.Path(web.router, "icon", "filename", "icon-512.png"), Sizes: "512x512", Type: "image/png"},
-		},
-	}
-
-	w.Header().Set("Cache-Control", "max-age=259200")
-	w.Header().Set("Content-Type", "application/manifest+json")
-	if data, err := json.Marshal(manifest); err != nil {
-		logger.Error("encode for response failed, %v", err)
-	} else {
-		w.Write(data)
-	}
-}
-
-func (web *web) showFavicon(w http.ResponseWriter, r *http.Request) {
-	logger.Info("access favicon")
-
-	blob, err := template.LoadImageFile("favicon.ico")
-	if err != nil {
-		return
-	}
-	w.Header().Set("Cache-Control", "max-age=2592000")
-	w.Header().Set("Content-Type", "image/x-icon")
-	w.Write(blob)
-}
-
-func (web *web) showAppIcon(w http.ResponseWriter, r *http.Request) {
-	logger.Info("access application icon")
-
-	filename := routeParam(r, "filename")
-	blob, err := template.LoadImageFile(filename)
-	if err != nil {
-		return
-	}
-	ext := path.Ext(filename)
-	w.Header().Set("Cache-Control", "max-age=2592000")
-	w.Header().Set("Content-Type", mime.TypeByExtension(ext))
-	w.Write(blob)
-}
-
-func (web *web) showJavascript(w http.ResponseWriter, r *http.Request) {
-	filename := routeParam(r, "name")
-	logger.Info("access javascript %s", filename)
-	_, found := template.JavascriptBundleChecksums[filename]
-	if !found {
-		return
-	}
-	contents := template.JavascriptBundles[filename]
-
-	w.Header().Set("Cache-Control", "max-age=2592000")
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.Write(contents)
-}
-
-func (web *web) process(w http.ResponseWriter, r *http.Request) {
-	logger.Info("process request start...")
-	metrics.IncrementWayback(metrics.ServiceWeb, metrics.StatusRequest)
-
-	if r.Method != http.MethodPost {
-		logger.Warn("request method no specific.")
-		http.Redirect(w, r, "/", http.StatusNotModified)
-		return
-	}
-
-	if err := r.ParseForm(); err != nil {
-		logger.Error("parse form error, %v", err)
-		http.Redirect(w, r, "/", http.StatusNotModified)
-		return
-	}
-
-	text := r.PostFormValue("text")
-	if len(strings.TrimSpace(text)) == 0 {
-		logger.Warn("post form value empty.")
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
-	}
-	logger.Debug("text: %s", text)
-
-	urls := service.MatchURL(text)
-	if len(urls) == 0 {
-		logger.Warn("url no found.")
-	}
-
-	var bundles reduxer.Bundles
-	col, _ := wayback.Wayback(context.TODO(), &bundles, urls...)
-	logger.Debug("bundles: %#v", bundles)
-
-	collector := transform(col)
-	ctx := context.WithValue(context.Background(), publish.PubBundle, bundles)
-	switch r.PostFormValue("data-type") {
-	case "json":
-		w.Header().Set("Content-Type", "application/json")
-
-		if data, err := json.Marshal(collector); err != nil {
-			logger.Error("encode for response failed, %v", err)
-			metrics.IncrementWayback(metrics.ServiceWeb, metrics.StatusFailure)
-		} else {
-			if len(urls) > 0 {
-				metrics.IncrementWayback(metrics.ServiceWeb, metrics.StatusSuccess)
-				go publish.To(ctx, col, "web")
-			}
-			w.Write(data)
+	switch {
+	case h.serveOnion():
+		logger.Info("start a tor hidden server")
+		err := h.startOnionService(server)
+		if err != nil {
+			return errors.Wrap(err, "start tor server failed")
 		}
 	default:
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-
-		if html, ok := web.template.Render("layout", collector); ok {
-			if len(urls) > 0 {
-				metrics.IncrementWayback(metrics.ServiceWeb, metrics.StatusSuccess)
-				go publish.To(ctx, col, "web")
-			}
-			w.Write(html)
-		} else {
-			metrics.IncrementWayback(metrics.ServiceWeb, metrics.StatusFailure)
-			logger.Error("render template for response failed")
-		}
+		logger.Info("start a clear web server")
+		server.Addr = h.opts.ListenAddr()
+		go startHTTPServer(server)
+		h.Lock()
+		h.server = server
+		h.Unlock()
 	}
+
+	// Block until context done
+	<-h.ctx.Done()
+
+	return ErrServiceClosed
 }
 
-func (web *web) playback(w http.ResponseWriter, r *http.Request) {
-	logger.Info("playback request start...")
-	metrics.IncrementPlayback(metrics.ServiceWeb, metrics.StatusRequest)
+// Shutdown shuts down the httpd server
+func (h *Httpd) Shutdown() error {
+	h.RLock()
+	defer h.RUnlock()
 
-	if err := r.ParseForm(); err != nil {
-		logger.Error("parse form error, %v", err)
-		http.Redirect(w, r, "/", http.StatusNotModified)
-		return
-	}
-
-	text := r.PostFormValue("text")
-	if len(strings.TrimSpace(text)) == 0 {
-		logger.Warn("post form value empty.")
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
-	}
-	logger.Debug("text: %s", text)
-
-	urls := service.MatchURL(text)
-	if len(urls) == 0 {
-		logger.Warn("url no found.")
-	}
-	col, _ := wayback.Playback(context.TODO(), urls...)
-	collector := transform(col)
-	switch r.PostFormValue("data-type") {
-	case "json":
-		w.Header().Set("Content-Type", "application/json")
-
-		if data, err := json.Marshal(collector); err != nil {
-			logger.Error("encode for response failed, %v", err)
-			metrics.IncrementPlayback(metrics.ServiceWeb, metrics.StatusFailure)
-		} else {
-			if len(urls) > 0 {
-				metrics.IncrementPlayback(metrics.ServiceWeb, metrics.StatusSuccess)
-			}
-			w.Write(data)
-		}
-	default:
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-
-		if html, ok := web.template.Render("layout", collector); ok {
-			if len(urls) > 0 {
-				metrics.IncrementPlayback(metrics.ServiceWeb, metrics.StatusSuccess)
-			}
-			w.Write(html)
-		} else {
-			metrics.IncrementPlayback(metrics.ServiceWeb, metrics.StatusFailure)
-			logger.Error("render template for response failed")
+	// Close onion service.
+	if h.tor != nil {
+		if err := h.tor.Close(); err != nil {
+			return err
 		}
 	}
-}
-
-func transform(cols []wayback.Collect) template.Collector {
-	collects := []template.Collect{}
-	for _, col := range cols {
-		collects = append(collects, template.Collect{
-			Slot: col.Arc,
-			Src:  col.Src,
-			Dst:  col.Dst,
-		})
+	// Shutdown http server
+	if h.server != nil {
+		if err := h.server.Shutdown(h.ctx); err != nil {
+			return err
+		}
 	}
-	return collects
+	return nil
 }
 
-func routeParam(r *http.Request, param string) string {
-	vars := mux.Vars(r)
-	return vars[param]
+func startHTTPServer(server *http.Server) {
+	logger.Info(`Listening on "%s" without TLS`, color.Blue.Sprint(server.Addr))
+	if err := server.ListenAndServe(); err != http.ErrServerClosed {
+		logger.Fatal("Server failed to start: %v", err)
+	}
 }

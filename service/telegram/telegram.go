@@ -8,12 +8,14 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/fatih/color"
+	"github.com/gookit/color"
+	"github.com/wabarc/helper"
 	"github.com/wabarc/logger"
 	"github.com/wabarc/wayback"
 	"github.com/wabarc/wayback/config"
@@ -27,13 +29,19 @@ import (
 	"github.com/wabarc/wayback/storage"
 	"github.com/wabarc/wayback/template/render"
 
-	telegram "gopkg.in/tucnak/telebot.v2"
+	telegram "gopkg.in/telebot.v3"
 )
+
+// Interface guard
+var _ service.Servicer = (*Telegram)(nil)
 
 // ErrServiceClosed is returned by the Service's Serve method after a call to Shutdown.
 var ErrServiceClosed = errors.New("telegram: Service closed")
 
-var pollTick = 3 * time.Second
+var (
+	pollTick = 3 * time.Second
+	space    = ` `
+)
 
 // Telegram represents a Telegram service in the application.
 type Telegram struct {
@@ -41,33 +49,29 @@ type Telegram struct {
 
 	bot   *telegram.Bot
 	store *storage.Storage
-	pool  pooling.Pool
+	opts  *config.Options
+	pool  *pooling.Pool
+	pub   *publish.Publish
 }
 
 // New Telegram struct.
-func New(ctx context.Context, store *storage.Storage, pool pooling.Pool) *Telegram {
-	if config.Opts.TelegramToken() == "" {
-		logger.Fatal("missing required environment variable")
-	}
-	if store == nil {
-		logger.Fatal("must initialize storage")
-	}
-	if pool == nil {
-		logger.Fatal("must initialize pooling")
+func New(ctx context.Context, opts service.Options) (*Telegram, error) {
+	if !opts.Config.TelegramEnabled() {
+		return nil, errors.New("missing required environment variable, skipped")
 	}
 	bot, err := telegram.NewBot(telegram.Settings{
-		Token: config.Opts.TelegramToken(),
-		// Verbose:   config.Opts.HasDebugMode(),
+		Token: opts.Config.TelegramToken(),
+		// Verbose:   opts.Config.HasDebugMode(),
 		ParseMode: telegram.ModeHTML,
 		Poller:    &telegram.LongPoller{Timeout: pollTick},
-		Reporter: func(err error) {
+		OnError: func(err error, _ telegram.Context) {
 			if err != nil {
 				logger.Warn(err.Error())
 			}
 		},
 	})
 	if err != nil {
-		logger.Fatal("create telegram bot instance failed: %v", err)
+		return nil, errors.Wrap(err, "create telegram bot instance failed")
 	}
 
 	if ctx == nil {
@@ -77,9 +81,11 @@ func New(ctx context.Context, store *storage.Storage, pool pooling.Pool) *Telegr
 	return &Telegram{
 		ctx:   ctx,
 		bot:   bot,
-		store: store,
-		pool:  pool,
-	}
+		store: opts.Storage,
+		opts:  opts.Config,
+		pool:  opts.Pool,
+		pub:   opts.Publish,
+	}, nil
 }
 
 // Serve loop request message from the Telegram api server.
@@ -88,14 +94,15 @@ func (t *Telegram) Serve() (err error) {
 	if t.bot == nil {
 		return errors.New("Initialize telegram failed, error: %v", err)
 	}
-	logger.Info("authorized on account %s", color.BlueString(t.bot.Me.Username))
+	logger.Info("authorized on account %s", color.Blue.Sprint(t.bot.Me.Username))
 
-	if channel, err := t.bot.ChatByID(config.Opts.TelegramChannel()); err == nil {
+	if channel, err := t.bot.ChatByUsername(t.opts.TelegramChannel()); err == nil {
 		id := strconv.FormatInt(channel.ID, 10)
-		logger.Info("channel title: %s, channel id: %s", color.BlueString(channel.Title), color.BlueString(id))
+		logger.Info("channel title: %s, channel id: %s", color.Blue.Sprint(channel.Title), color.Blue.Sprint(id))
 	}
 
 	// Set bot commands
+	// nolint:errcheck
 	t.setCommands()
 
 	t.bot.Poller = telegram.NewMiddlewarePoller(t.bot.Poller, func(update *telegram.Update) bool {
@@ -112,7 +119,13 @@ func (t *Telegram) Serve() (err error) {
 			}
 
 			// Query playback callback data from database
-			pb, err := t.store.Playback(id)
+			x := strconv.Itoa(id)
+			u, err := strconv.ParseUint(x, 10, 64)
+			if err != nil {
+				logger.Error("parse uint failed: %v", err)
+				return false
+			}
+			pb, err := t.store.Playback(u)
 			if err != nil {
 				logger.Error("query playback data failed: %v", err)
 				metrics.IncrementWayback(metrics.ServiceTelegram, metrics.StatusFailure)
@@ -126,9 +139,10 @@ func (t *Telegram) Serve() (err error) {
 				return false
 			}
 
-			callback.Message.Text = string(data)
-			go t.process(callback.Message)
+			callback.Message.Text = helper.Byte2String(data)
+			go t.process(callback.Message) // nolint:errcheck
 		case update.Message != nil && update.Message.FromGroup():
+			transform(update.Message)
 			logger.Debug("message: %#v", update.Message)
 			// Reply message and mention bot on the group
 			if update.Message.ReplyTo != nil {
@@ -137,10 +151,11 @@ func (t *Telegram) Serve() (err error) {
 			if !strings.Contains(update.Message.Text, "@"+t.bot.Me.Username) {
 				return false
 			}
-			go t.process(update.Message)
+			go t.process(update.Message) // nolint:errcheck
 		case update.Message != nil:
+			transform(update.Message)
 			logger.Debug("message: %#v", update.Message)
-			go t.process(update.Message)
+			go t.process(update.Message) // nolint:errcheck
 		default:
 			logger.Debug("update: %#v", update)
 		}
@@ -173,9 +188,6 @@ func (t *Telegram) process(message *telegram.Message) (err error) {
 	content := message.Text
 	logger.Debug("content: %s", content)
 
-	if message.Caption != "" {
-		content = fmt.Sprintf("Text: \n%s\nCaption: \n%s", content, message.Caption)
-	}
 	// If the message is forwarded and contains multiple entities,
 	// the update will be split into multiple parts.
 	// Don't process parts of the forwarded message without text.
@@ -183,7 +195,7 @@ func (t *Telegram) process(message *telegram.Message) (err error) {
 	if message.IsForwarded() && content == "" {
 		return nil
 	}
-	urls := service.MatchURL(content)
+	urls := service.ExcludeURL(service.MatchURL(t.opts, content), "t.me")
 
 	// Set command as playback if receive a playback command without URLs, and
 	// required user reply a message with URLs.
@@ -196,12 +208,13 @@ func (t *Telegram) process(message *telegram.Message) (err error) {
 	command := command(content)
 	switch {
 	case command == "help", command == "start":
-		t.reply(message, config.Opts.TelegramHelptext())
+		// nolint:errcheck
+		t.reply(message, t.opts.TelegramHelptext())
 	case command == "playback":
 		return t.playback(message)
 	case command == "metrics":
 		stats := metrics.Gather.Export("wayback")
-		if config.Opts.EnabledMetrics() && stats != "" {
+		if t.opts.EnabledMetrics() && stats != "" {
 			if _, err = t.reply(message, stats); err != nil {
 				return err
 			}
@@ -212,82 +225,92 @@ func (t *Telegram) process(message *telegram.Message) (err error) {
 		if fallback != "" {
 			fallback = fmt.Sprintf("\n\nAvailable commands:\n%s", fallback)
 		}
+		// nolint:errcheck
 		t.reply(message, fmt.Sprintf("/%s is an illegal command%s", command, fallback))
 	case len(urls) == 0:
 		logger.Warn("archives failure, URL no found.")
 		metrics.IncrementWayback(metrics.ServiceTelegram, metrics.StatusRequest)
-		t.reply(message, "URL no found.")
+		t.reply(message, "URL no found.") // nolint:errcheck
 	default:
 		metrics.IncrementWayback(metrics.ServiceTelegram, metrics.StatusRequest)
-		if message, err = t.reply(message, "Queue..."); err != nil {
-			logger.Error("reply queue failed: %v", err)
-			return
+		request, err := t.reply(message, "Queue...")
+		if err != nil {
+			return errors.Wrap(err, "reply message failed")
 		}
-		t.pool.Roll(func() {
-			if err := t.wayback(t.ctx, message, urls); err != nil {
-				logger.Error("archives failed: %v", err)
+		bucket := pooling.Bucket{
+			Request: func(ctx context.Context) error {
+				_, err := t.bot.Edit(request, "Archiving...")
+				if err != nil && err != telegram.ErrSameMessageContent {
+					return errors.Wrap(err, "telegram: send archiving message failed")
+				}
+
+				if err := t.wayback(ctx, request, urls); err != nil {
+					// nolint:errcheck
+					t.bot.Edit(request, service.MsgWaybackRetrying)
+					return errors.Wrap(err, "archives failed")
+				}
+				metrics.IncrementWayback(metrics.ServiceTelegram, metrics.StatusSuccess)
+				return nil
+			},
+			Fallback: func(_ context.Context) error {
+				t.bot.Delete(request)                           // nolint:errcheck
+				t.bot.Reply(message, service.MsgWaybackTimeout) // nolint:errcheck
 				metrics.IncrementWayback(metrics.ServiceTelegram, metrics.StatusFailure)
-				return
-			}
-			metrics.IncrementWayback(metrics.ServiceTelegram, metrics.StatusSuccess)
-		})
+				return nil
+			},
+		}
+		t.pool.Put(bucket)
 	}
 	return nil
 }
 
-func (t *Telegram) wayback(ctx context.Context, message *telegram.Message, urls []string) error {
-	stage, err := t.bot.Edit(message, "Archiving...")
-	if err != nil {
-		logger.Error("send archiving message failed: %v", err)
-		return err
-	}
-	logger.Debug("send archiving messagee result: %v", stage)
+func (t *Telegram) wayback(ctx context.Context, request *telegram.Message, urls []*url.URL) error {
+	do := func(cols []wayback.Collect, rdx reduxer.Reduxer) error {
+		opts := &telegram.SendOptions{DisableWebPagePreview: true}
+		replyText := render.ForReply(&render.Telegram{Cols: cols, Data: rdx}).String()
+		logger.Debug("reply text, %s", replyText)
 
-	var bundles reduxer.Bundles
-	cols, err := wayback.Wayback(ctx, &bundles, urls...)
-	if err != nil {
-		logger.Error("archives failed: %v", err)
-		return err
-	}
-	logger.Debug("bundles: %#v", bundles)
+		if _, err := t.bot.Edit(request, replyText, opts); err != nil {
+			return errors.Wrap(err, "telegram: update message failed")
+		}
 
-	replyText := render.ForReply(&render.Telegram{Cols: cols, Data: bundles}).String()
-	logger.Debug("reply text, %s", replyText)
+		t.pub.Spread(ctx, rdx, cols, publish.FlagTelegram)
 
-	opts := &telegram.SendOptions{DisableWebPagePreview: true}
-	if _, err := t.bot.Edit(stage, replyText, opts); err != nil {
-		logger.Error("update message failed: %v", err)
-		return err
-	}
+		var albums telegram.Album
+		var head = render.Title(cols, rdx)
 
-	ctx = context.WithValue(ctx, publish.FlagTelegram, t.bot)
-	ctx = context.WithValue(ctx, publish.PubBundle, bundles)
-	go publish.To(ctx, cols, publish.FlagTelegram.String())
+		for _, u := range urls {
+			if b, ok := rdx.Load(reduxer.Src(u.String())); ok {
+				albums = append(albums, service.UploadToTelegram(t.opts, b.Artifact(), head)...)
+			}
+		}
+		if len(albums) == 0 {
+			logger.Debug("no albums to send")
+			return nil
+		}
 
-	var album telegram.Album
-	for _, bundle := range bundles {
-		album = append(album, publish.UploadToTelegram(bundle)...)
-	}
-	// Send album attach files, and reply to wayback result message
-	opts = &telegram.SendOptions{ReplyTo: stage, DisableNotification: true}
-	if _, err := t.bot.SendAlbum(stage.Chat, album, opts); err != nil {
-		logger.Error("reply failed: %v", err)
+		// Send album attach files, and reply to wayback result message
+		opts = &telegram.SendOptions{ReplyTo: request, DisableNotification: true}
+		if _, err := t.bot.SendAlbum(request.Chat, albums, opts); err != nil {
+			logger.Error("reply failed: %v", err)
+		}
+		return nil
 	}
 
-	return nil
+	return service.Wayback(ctx, t.opts, urls, do)
 }
 
 func (t *Telegram) playback(message *telegram.Message) error {
 	metrics.IncrementPlayback(metrics.ServiceTelegram, metrics.StatusRequest)
 
-	recipient, err := t.bot.ChatByID(fmt.Sprint(message.Chat.ID))
+	recipient, err := t.bot.ChatByID(message.Chat.ID)
 	if err != nil {
 		metrics.IncrementPlayback(metrics.ServiceTelegram, metrics.StatusFailure)
 		logger.Error("playback failed: %v", err)
 		return err
 	}
 
-	urls := service.MatchURL(message.Text)
+	urls := service.MatchURL(t.opts, message.Text)
 	if len(urls) == 0 {
 		opts := &telegram.SendOptions{
 			ReplyTo:               message,
@@ -306,12 +329,15 @@ func (t *Telegram) playback(message *telegram.Message) error {
 	if err = t.bot.Notify(message.Sender, telegram.Typing); err != nil {
 		logger.Error("send typing action failed: %v", err)
 	}
-	cols, _ := wayback.Playback(t.ctx, urls...)
+	cols, err := wayback.Playback(t.ctx, t.opts, urls...)
+	if err != nil {
+		return errors.Wrap(err, "telegram: playback failed")
+	}
 	logger.Debug("playback collections: %#v", cols)
 
 	// Due to Telegram restricted callback data to 1-64 bytes, it requires to store
 	// playback URLs to database.
-	data := []byte(strings.ReplaceAll(callbackPrefix()+message.Text, "/playback", ""))
+	data := helper.String2Byte(strings.ReplaceAll(callbackPrefix()+message.Text, "/playback", ""))
 	pb := &entity.Playback{Source: base64.StdEncoding.EncodeToString(data)}
 	if err := t.store.CreatePlayback(pb); err != nil {
 		logger.Error("store collections failed: %v", err)
@@ -325,7 +351,7 @@ func (t *Telegram) playback(message *telegram.Message) error {
 			InlineKeyboard: [][]telegram.InlineButton{
 				{{
 					Text: "wayback",
-					Data: strconv.Itoa(pb.ID),
+					Data: strconv.FormatUint(pb.ID, 10),
 				}},
 			},
 		},
@@ -367,7 +393,7 @@ func (t *Telegram) commandFallback() string {
 }
 
 func (t *Telegram) getCommands() []telegram.Command {
-	commands, err := t.bot.GetCommands()
+	commands, err := t.bot.Commands()
 	if err != nil {
 		logger.Error("got my commands failed: %v", err)
 	}
@@ -377,7 +403,7 @@ func (t *Telegram) getCommands() []telegram.Command {
 		maps[command.Text] = true
 	}
 
-	for _, command := range defaultCommands() {
+	for _, command := range t.defaultCommands() {
 		if maps[command.Text] {
 			continue
 		}
@@ -401,7 +427,7 @@ func (t *Telegram) setCommands() error {
 	return nil
 }
 
-func defaultCommands() []telegram.Command {
+func (t *Telegram) defaultCommands() []telegram.Command {
 	commands := []telegram.Command{
 		{
 			Text:        "help",
@@ -412,7 +438,7 @@ func defaultCommands() []telegram.Command {
 			Description: "Playback archived url",
 		},
 	}
-	if config.Opts.EnabledMetrics() {
+	if t.opts.EnabledMetrics() {
 		commands = append(commands, telegram.Command{
 			Text:        "metrics",
 			Description: "Show service metrics",
@@ -444,5 +470,30 @@ func command(message string) string {
 		return "metrics"
 	default:
 		return matchCmd(message)
+	}
+}
+
+func transform(m *telegram.Message) {
+	entities := func(e telegram.Entities) (uri []string) {
+		for _, entity := range e {
+			if entity.URL != "" {
+				uri = append(uri, entity.URL)
+			}
+		}
+		return
+	}
+
+	// At lease one embed link is included in the message.
+	if len(m.Entities) > 0 {
+		uri := entities(m.Entities)
+		m.Text = fmt.Sprintf("%s and URI in message entity: %s", m.Text, strings.Join(uri, space))
+	}
+	// The message body is an attachment with a caption.
+	if m.Caption != "" {
+		m.Text = fmt.Sprintf("%s and caption: %s", m.Text, m.Caption)
+	}
+	if len(m.CaptionEntities) > 0 {
+		uri := entities(m.CaptionEntities)
+		m.Text = fmt.Sprintf("%s and URI in caption entity: %s", m.Text, strings.Join(uri, space))
 	}
 }

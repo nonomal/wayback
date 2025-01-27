@@ -1,5 +1,9 @@
+# Copyright 2020 Wayback Archiver. All rights reserved.
+# Use of this source code is governed by the GNU GPL v3
+# license that can be found in the LICENSE file.
+#
 # syntax=docker/dockerfile:1.2
-ARG GO_VERSION=1.17
+ARG GO_VERSION=1.22
 
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS builder
 COPY --from=tonistiigi/xx:golang / /
@@ -7,7 +11,15 @@ COPY --from=tonistiigi/xx:golang / /
 RUN apk add --no-cache -U build-base ca-certificates linux-headers musl-dev git tar
 
 ARG TARGETPLATFORM
+ARG WAYBACK_IPFS_TARGET
+ARG WAYBACK_IPFS_APIKEY
+ARG WAYBACK_IPFS_SECRET
+
 WORKDIR /src
+
+ENV WAYBACK_IPFS_TARGET ${WAYBACK_IPFS_TARGET}
+ENV WAYBACK_IPFS_APIKEY ${WAYBACK_IPFS_APIKEY}
+ENV WAYBACK_IPFS_SECRET ${WAYBACK_IPFS_SECRET}
 
 COPY . .
 RUN --mount=type=bind,target=/src,rw \
@@ -18,7 +30,7 @@ RUN --mount=type=bind,target=/src,rw \
     && mv ./build/binary/wayback-* /wayback
 
 # Application layer
-FROM alpine:3.13
+FROM alpine:3.17
 
 LABEL org.wabarc.homepage="http://github.com/wabarc" \
       org.wabarc.repository="http://github.com/wabarc/wayback" \
@@ -69,17 +81,15 @@ EXPOSE 8964
 # add flag `--format=docker` if using podman.
 # Ref: https://wiki.alpinelinux.org/wiki/Fonts
 ONBUILD RUN set -o pipefail; \
-    echo @edge https://dl-cdn.alpinelinux.org/alpine/edge/community >> /etc/apk/repositories; \
-    echo @edge https://dl-cdn.alpinelinux.org/alpine/edge/main >> /etc/apk/repositories; \
     apk add --no-cache -U \
-    chromium@edge \
+    chromium \
     dbus \
     dumb-init \
-    ffmpeg@edge \
-    freetype@edge \
+    ffmpeg \
+    freetype \
     libstdc++ \
-    harfbuzz@edge \
-    nss@edge \
+    harfbuzz \
+    nss \
     you-get \
     rtmpdump \
     youtube-dl \

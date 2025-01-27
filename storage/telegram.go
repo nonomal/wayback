@@ -7,6 +7,7 @@ package storage // import "github.com/wabarc/wayback/storage"
 import (
 	"bytes"
 
+	"github.com/wabarc/helper"
 	"github.com/wabarc/logger"
 	"github.com/wabarc/wayback/entity"
 	bolt "go.etcd.io/bbolt"
@@ -17,9 +18,9 @@ func (s *Storage) createPlaybackBucket() error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer tx.Rollback() //nolint:errcheck
 
-	_, err = tx.CreateBucketIfNotExists([]byte(entity.EntityPlayback))
+	_, err = tx.CreateBucketIfNotExists(helper.String2Byte(entity.EntityPlayback))
 	if err != nil {
 		return err
 	}
@@ -32,13 +33,13 @@ func (s *Storage) createPlaybackBucket() error {
 }
 
 // Playback returns playback data of the given id.
-func (s *Storage) Playback(id int) (*entity.Playback, error) {
+func (s *Storage) Playback(id uint64) (*entity.Playback, error) {
 	var pb entity.Playback
 
 	err := s.db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(entity.EntityPlayback))
+		b := tx.Bucket(helper.String2Byte(entity.EntityPlayback))
 		v := b.Get(itob(id))
-		pb.Source = string(v)
+		pb.Source = helper.Byte2String(v)
 		pb.ID = id
 		return nil
 	})
@@ -54,7 +55,7 @@ func (s *Storage) CreatePlayback(pb *entity.Playback) error {
 	}
 
 	return s.db.Update(func(tx *bolt.Tx) (err error) {
-		b := tx.Bucket([]byte(entity.EntityPlayback))
+		b := tx.Bucket(helper.String2Byte(entity.EntityPlayback))
 		id, err := b.NextSequence()
 		if err != nil {
 			logger.Error("generate id for playback failed: %v", err)
@@ -62,7 +63,7 @@ func (s *Storage) CreatePlayback(pb *entity.Playback) error {
 		}
 		logger.Debug("putting data to bucket, id: %d, value: %s", id, pb.Source)
 
-		pb.ID = int(id)
+		pb.ID = id
 		buf := bytes.NewBufferString(pb.Source).Bytes()
 
 		return b.Put(itob(pb.ID), buf)

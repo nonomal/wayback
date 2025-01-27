@@ -1,3 +1,7 @@
+# Copyright 2020 Wayback Archiver. All rights reserved.
+# Use of this source code is governed by the GNU GPL v3
+# license that can be found in the LICENSE file.
+#
 %undefine _disable_source_fetch
 
 Name:    wayback
@@ -14,6 +18,7 @@ Source4: CHANGELOG.md
 BuildRoot: %{_topdir}/BUILD/%{name}-%{version}-%{release}
 BuildArch: x86_64
 Requires(pre): shadow-utils
+Recommends: chromium, youtube-dl, tor, wget, libwebp, nss
 
 %{?systemd_requires}
 BuildRequires: systemd
